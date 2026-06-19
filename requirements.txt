@@ -1,0 +1,10 @@
+torch>=2.0
+torchvision>=0.15
+transformers>=4.35
+pytorch-metric-learning>=2.3
+scipy>=1.10
+timm>=0.9
+pillow
+pandas
+tqdm
+numpy
