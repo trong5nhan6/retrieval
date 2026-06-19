@@ -48,7 +48,7 @@ class HyMSConfig:
     rr_reroute: bool  = True
 
     # ── Training ──────────────────────────────────────────────────────────
-    batch_size:    int   = 120     # class-balanced sampler (see data loader)
+    batch_size:    int   = 128     # class-balanced sampler (see data loader)
     epochs:        int   = 60
     frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)

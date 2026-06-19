@@ -32,6 +32,31 @@ from losses.routing_consistency import RoutingConsistencyLoss
 from eval.routerank import evaluate_self, evaluate_query_gallery
 
 
+def apply_overrides(cfg):
+    """Áp config override do notebook ghi ra (ghi đè config.py cho lần chạy này).
+
+    Đọc file JSON tại $HCFG_OVERRIDES nếu được set, mặc định
+    'results/_notebook_overrides.json'. Mỗi key phải là một field hợp lệ của HCFG.
+    Gọi TRƯỚC parse_args() để các default của argparse cũng nhận giá trị mới.
+    """
+    path = os.environ.get("HCFG_OVERRIDES",
+                          os.path.join("results", "_notebook_overrides.json"))
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        overrides = json.load(f)
+    applied, skipped = {}, []
+    for k, v in overrides.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v); applied[k] = v
+        else:
+            skipped.append(k)
+    if applied:
+        print(f"[overrides] từ {path}: {applied}")
+    if skipped:
+        print(f"[overrides] BỎ QUA (không phải field của HCFG): {skipped}")
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop"])
@@ -56,6 +81,7 @@ def evaluate(model, loaders, dataset, device):
 
 
 def main():
+    apply_overrides(HCFG)          # notebook overrides -> trước parse_args để default lấy giá trị mới
     args = parse_args()
     HCFG.lambda_route = args.lambda_route
     set_seed(args.seed)
@@ -82,7 +108,20 @@ def main():
     model = HyMSRoute(encoder, HCFG).to(device)
 
     n_head = sum(p.numel() for p in model.head_parameters() if p.requires_grad)
-    log(f"Trainable head params: {n_head:,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # ── tóm tắt tham số trước khi train ───────────────────────────────────
+    log("----- Tham số chạy -----")
+    log(f"  total params   : {total_params:,}")
+    log(f"  trainable params: {train_params:,} (head {n_head:,})")
+    log(f"  epochs         : {args.epochs} (frozen {args.frozen_epochs}, finetune_blocks {args.finetune_blocks})")
+    log(f"  lr             : head {args.head_lr} | backbone {args.backbone_lr}")
+    log(f"  batch_size     : {HCFG.classes_per_batch * HCFG.samples_per_class} "
+        f"(classes_per_batch {HCFG.classes_per_batch} x samples_per_class {HCFG.samples_per_class})")
+    log(f"  n_experts      : {HCFG.n_experts} | slots_per_expert {HCFG.slots_per_expert} | num_slots {HCFG.num_slots}")
+    log(f"  embed_dim      : {HCFG.embed_dim} | route_dim {HCFG.route_dim} | lambda_route {HCFG.lambda_route}")
+    log("------------------------")
 
     # ── config snapshot tied to this run ──────────────────────────────────
     cfg_snapshot = dataclasses.asdict(HCFG)
