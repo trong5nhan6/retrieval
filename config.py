@@ -84,9 +84,9 @@ class HyMSConfig:
 
     # ── Dataset roots (override per environment / Kaggle) ────────────────
     data_roots: Dict[str, str] = field(default_factory=lambda: {
-        "cub":    "data/CUB_200_2011",
-        "cars":   "data/cars196",
-        "inshop": "data/inshop",
+        "cub":    "datasets/CUB_200_2011",
+        "cars":   "datasets/Cars196",
+        "inshop": "datasets/In-shop Clothes Retrieval Benchmark",
     })
 
     @property

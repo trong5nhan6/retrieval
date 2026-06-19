@@ -3,7 +3,7 @@ __pycache__/
 *.pyo
 .ipynb_checkpoints/
 results/
-data/
+datasets/
 *.pt
 *.pth
 .DS_Store
