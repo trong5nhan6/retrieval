@@ -18,6 +18,9 @@ Outputs:
   results/history_hyms_{dataset}_seed{seed}.csv
 """
 import os, argparse, json, dataclasses, datetime, math
+# Reduce CUDA fragmentation (must be set BEFORE torch initializes CUDA).
+# Fixes the "reserved but unallocated" OOM that hits eval after Stage-2 unfreeze.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import pandas as pd
 from tqdm import tqdm
@@ -74,6 +77,8 @@ def parse_args():
 
 
 def evaluate(model, loaders, dataset, device):
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
     use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
     if dataset in ("cub", "cars"):
