@@ -78,8 +78,18 @@ class HyMSRoute(nn.Module):
 
         # ── heads ─────────────────────────────────────────────────────────
         self.pool = AttnPool(d)
-        self.embed_proj = nn.Sequential(
-            nn.Linear(d, cfg.embed_dim), nn.LayerNorm(cfg.embed_dim))
+        # local (refinement) branch: pooled MoE tokens -> embed_dim
+        self.local_proj = nn.Linear(d, cfg.embed_dim)
+        # global skip branch: CLS -> embed_dim (the data-efficient "floor").
+        self.use_cls_skip = cfg.use_cls_skip and self.use_vit
+        if self.use_cls_skip:
+            self.cls_proj = nn.Linear(encoder.vit_dim, cfg.embed_dim)
+            # zero-init gate on the local branch (LayerScale/ReZero): at start
+            # z == CLS baseline; the heavy MoE branch is learned only if it helps.
+            self.local_gate = nn.Parameter(torch.tensor(float(cfg.local_gate_init)))
+        # final normalization before L2 (BNNeck, or LayerNorm fallback)
+        self.embed_norm = (nn.BatchNorm1d(cfg.embed_dim) if cfg.bnneck
+                           else nn.LayerNorm(cfg.embed_dim))
         # route_head only meaningful when Soft MoE produces combine weights.
         self.route_head = nn.Sequential(
             nn.Linear(cfg.num_slots, cfg.route_dim), nn.LayerNorm(cfg.route_dim)
@@ -107,18 +117,24 @@ class HyMSRoute(nn.Module):
         return torch.cat(toks, dim=1)                          # [B, m, d]
 
     def forward(self, imgs):
-        vit_tokens, cnn_maps = self.encoder(imgs)
+        vit_tokens, cls, cnn_maps = self.encoder(imgs)
         X = self._assemble_tokens(vit_tokens, cnn_maps)        # [B, m, d]
         if self.cfg.feat_noise > 0 and self.training:
             X = X + self.cfg.feat_noise * torch.randn_like(X)
         X = self.input_drop(X)
 
         if self.use_moe:
-            Y, combine = self.softmoe(X)                       # [B,m,d], [B,m,S]
+            Y, combine = self.softmoe(X)                       # MoE = main processor
         else:
             Y, combine = X, None                               # bypass: pool raw tokens
 
-        z = F.normalize(self.embed_proj(self.pool(Y)), dim=-1)  # [B, embed_dim]
+        # local (refined) descriptor + optional direct CLS skip, gated fusion
+        local = self.local_proj(self.pool(Y))                  # [B, embed_dim]
+        if self.use_cls_skip:
+            fused = self.cls_proj(cls) + self.local_gate * local
+        else:
+            fused = local
+        z = F.normalize(self.embed_norm(fused), dim=-1)        # [B, embed_dim]
 
         if combine is not None:
             usage = combine.mean(dim=1)                        # [B, S] slot-usage

@@ -39,11 +39,12 @@ class FakeEncoder(nn.Module):
     def forward(self, imgs):
         b = imgs.size(0)
         vit_tokens = torch.randn(b, 256, D_VIT) if self.use_vit else None
+        cls = torch.randn(b, D_VIT) if self.use_vit else None
         cnn_maps = []
         if self.use_cnn:
             for c in STAGE_DIMS:
                 cnn_maps.append(torch.randn(b, c, 7, 7))
-        return vit_tokens, cnn_maps
+        return vit_tokens, cls, cnn_maps
 
     def freeze_all(self):
         pass

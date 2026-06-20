@@ -162,6 +162,7 @@ def main():
         f"(classes_per_batch {HCFG.classes_per_batch} x samples_per_class {HCFG.samples_per_class})")
     log(f"  n_experts      : {HCFG.n_experts} | slots_per_expert {HCFG.slots_per_expert} | num_slots {HCFG.num_slots}")
     log(f"  embed_dim      : {HCFG.embed_dim} | route_dim {HCFG.route_dim} | lambda_route {HCFG.lambda_route}")
+    log(f"  fusion         : cls_skip={HCFG.use_cls_skip} gate_init={HCFG.local_gate_init} bnneck={HCFG.bnneck}")
     log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
     log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
     loss_desc = (f"triplet(margin={HCFG.triplet_margin}, miner={HCFG.triplet_miner})"
@@ -244,13 +245,19 @@ def main():
             tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
 
         n = len(loaders["train"])
+        # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
+        gp = getattr(model, "local_gate", None)
+        gate = float(gp.detach().cpu()) if gp is not None else None
         # ── TRAIN log every epoch ─────────────────────────────────────────
         train_row = {"epoch": epoch, "stage": stage,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
-                     "route": round(tot_rt / n, 4)}
+                     "route": round(tot_rt / n, 4),
+                     "gate": round(gate, 4) if gate is not None else None}
         train_log.append(train_row)
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
-        log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} (sc={tot_sc/n:.4f} rt={tot_rt/n:.4f})")
+        gate_str = f" gate={gate:+.4f}" if gate is not None else ""
+        log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} "
+            f"(sc={tot_sc/n:.4f} rt={tot_rt/n:.4f}){gate_str}")
 
         if sched is not None:
             sched.step()
@@ -279,6 +286,10 @@ def main():
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
 
     log(f"Done. Best R@1={best:.2f}")
+    gp = getattr(model, "local_gate", None)
+    if gp is not None:
+        log(f"Final local_gate γ = {float(gp.detach().cpu()):+.4f}  "
+            f"(γ≈0 -> MoE branch không đóng góp; |γ| lớn -> MoE có ích)")
 
     # ── auto-plot test metrics + train loss -> results/plot_*_{run}.png ────
     try:

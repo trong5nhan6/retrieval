@@ -13,7 +13,7 @@ from typing import List, Dict
 class HyMSConfig:
     # ── Backbones ─────────────────────────────────────────────────────────
     vit_name:    str = "facebook/dinov2-base"      # HF DINOv2 ViT-B/14, 768-d
-    cnn_name:    str = "convnext_tiny"             # torchvision CNN
+    cnn_name:    str = "convnext_base"             # torchvision CNN
     image_size:  int = 224
 
     # CNN stages to use (indices into the 4 ConvNeXt stages: 0=s1 .. 3=s4)
@@ -21,7 +21,7 @@ class HyMSConfig:
     cnn_stages:  List[int] = field(default_factory=lambda: [0, 1, 2, 3])
 
     # ── Token assembly ────────────────────────────────────────────────────
-    token_dim:        int = 256     # common token dim d (both branches projected to this)
+    token_dim:        int = 768     # common token dim d (both branches projected to this)
     tokens_per_stage: int = 64      # TokenLearner output tokens per CNN stage
     tl_heads:         int = 4       # TokenLearner attention heads
     # ViT contributes its 256 patch tokens; CNN contributes len(cnn_stages)*tokens_per_stage.
@@ -36,19 +36,27 @@ class HyMSConfig:
 
     # ── Soft MoE ──────────────────────────────────────────────────────────
     n_experts:        int = 8
-    slots_per_expert: int = 4       # total slots S = n_experts * slots_per_expert
+    slots_per_expert: int = 2       # total slots S = n_experts * slots_per_expert
     expert_hidden:    int = 512
 
     # ── Heads ─────────────────────────────────────────────────────────────
-    embed_dim:   int = 256          # retrieval embedding z
+    embed_dim:   int = 512          # retrieval embedding z (was 256 bottleneck)
     route_dim:   int = 64           # routing descriptor rho
     dropout:     float = 0.1
+
+    # ── Embedding fusion (cải tiến) ───────────────────────────────────────
+    # z = L2( norm( cls_proj(CLS) + gate * local_proj(pool(MoE tokens)) ) )
+    # CLS skip = "sàn" data-efficient (≈ baseline). gate khởi tạo 0 => lúc bắt
+    # đầu z ≈ CLS baseline; nhánh MoE chỉ được học tới mức nó thực sự giúp.
+    use_cls_skip:    bool  = True   # đường CLS -> embedding trực tiếp (floor)
+    local_gate_init: float = 0.0    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
+    bnneck:          bool  = True   # BatchNorm1d trước L2 (False -> LayerNorm như cũ)
 
     # ── Loss ──────────────────────────────────────────────────────────────
     # Main embedding loss on z: "supcon" (Supervised Contrastive) or "triplet"
     # (TripletMarginLoss, optionally with semihard mining) to match baselines
     # that report "triploss". The routing loss on rho stays SupCon either way.
-    loss_type:         str   = "supcon"  # "supcon" | "triplet"
+    loss_type:         str   = "triplet"  # "supcon" | "triplet"
     temperature:       float = 0.07   # SupCon tau for z
     triplet_margin:    float = 0.1    # margin for TripletMarginLoss (+ its miner)
     triplet_miner:     bool  = True   # mine semihard triplets (TripletMarginMiner)

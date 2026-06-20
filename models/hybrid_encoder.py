@@ -88,10 +88,12 @@ class HybridEncoder(nn.Module):
 
     # ── forward ─────────────────────────────────────────────────────────────
     def forward(self, imgs: torch.Tensor):
-        # ViT patch tokens (drop CLS at index 0)
+        # ViT: CLS token (index 0) kept separately + patch tokens
         vit_tokens = None
+        cls = None
         if self.vit is not None:
             vit_out = self.vit(pixel_values=imgs).last_hidden_state   # [B, 1+P, 768]
+            cls = vit_out[:, 0]                                       # [B, 768] global descriptor
             vit_tokens = vit_out[:, 1:, :]                            # [B, P, 768]
 
         # CNN 4 stage maps
@@ -103,4 +105,4 @@ class HybridEncoder(nn.Module):
                 if i in self._CONVNEXT_STAGE_IDX:
                     cnn_maps.append(x)                                # [B, C_s, H, W]
 
-        return vit_tokens, cnn_maps
+        return vit_tokens, cls, cnn_maps
