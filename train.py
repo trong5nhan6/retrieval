@@ -17,11 +17,12 @@ Outputs:
   results/checkpoints/best_hyms_{dataset}_seed{seed}.pt
   results/history_hyms_{dataset}_seed{seed}.csv
 """
-import os, argparse, json, dataclasses, datetime
+import os, argparse, json, dataclasses, datetime, math
 import torch
 import pandas as pd
 from tqdm import tqdm
-from pytorch_metric_learning.losses import SupConLoss
+from pytorch_metric_learning.losses import SupConLoss, TripletMarginLoss
+from pytorch_metric_learning.miners import TripletMarginMiner
 
 from config import HCFG
 from utils import set_seed
@@ -74,16 +75,55 @@ def parse_args():
 
 def evaluate(model, loaders, dataset, device):
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
+    use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
     if dataset in ("cub", "cars"):
-        return evaluate_self(model, loaders["test"], device, HCFG, recall_k=rk)
+        return evaluate_self(model, loaders["test"], device, HCFG,
+                             use_routerank=use_rr, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],
-                                  device, HCFG, recall_k=rk)
+                                  device, HCFG, use_routerank=use_rr, recall_k=rk)
+
+
+def build_embed_loss(cfg):
+    """Main loss on the retrieval embedding z.
+
+    Returns (loss_fn, miner). For "triplet" we optionally mine semihard triplets;
+    both losses share the (embeddings, labels, indices_tuple) call signature."""
+    if cfg.loss_type == "triplet":
+        loss = TripletMarginLoss(margin=cfg.triplet_margin)
+        miner = (TripletMarginMiner(margin=cfg.triplet_margin,
+                                    type_of_triplets="semihard")
+                 if cfg.triplet_miner else None)
+        return loss, miner
+    if cfg.loss_type == "supcon":
+        return SupConLoss(temperature=cfg.temperature), None
+    raise ValueError(f"unknown loss_type: {cfg.loss_type!r} (use 'supcon' | 'triplet')")
+
+
+def make_scheduler(optimizer, n_epochs, warmup_epochs, kind):
+    """Per-stage scheduler stepped once per epoch.
+
+    "cosine": linear warmup for warmup_epochs, then cosine decay to 0 over the
+    remaining epochs. Scales every param-group equally, so the head:backbone LR
+    ratio is preserved. "constant": no scheduler (old behaviour)."""
+    if kind != "cosine":
+        return None
+
+    def lr_lambda(e):                       # e = epoch index within this stage (0-based)
+        if warmup_epochs > 0 and e < warmup_epochs:
+            return (e + 1) / warmup_epochs
+        prog = (e - warmup_epochs) / max(1, n_epochs - warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * min(1.0, prog)))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 def main():
     apply_overrides(HCFG)          # notebook overrides -> trước parse_args để default lấy giá trị mới
     args = parse_args()
     HCFG.lambda_route = args.lambda_route
+    # Soft MoE off => no rho => no routing loss / no routerank.
+    if not HCFG.use_moe:
+        HCFG.lambda_route = 0.0
     set_seed(args.seed)
     os.makedirs(HCFG.checkpoint_dir, exist_ok=True)
     os.makedirs(HCFG.results_dir, exist_ok=True)
@@ -103,7 +143,8 @@ def main():
     loaders = get_dml_loaders(args.dataset, HCFG)
     log(f"Train batches/epoch: {len(loaders['train'])}")
 
-    encoder = HybridEncoder(HCFG.vit_name, HCFG.cnn_name, device)
+    encoder = HybridEncoder(HCFG.vit_name, HCFG.cnn_name, device,
+                            use_vit=HCFG.use_vit, use_cnn=HCFG.use_cnn)
     encoder.freeze_all()
     model = HyMSRoute(encoder, HCFG).to(device)
 
@@ -121,6 +162,11 @@ def main():
         f"(classes_per_batch {HCFG.classes_per_batch} x samples_per_class {HCFG.samples_per_class})")
     log(f"  n_experts      : {HCFG.n_experts} | slots_per_expert {HCFG.slots_per_expert} | num_slots {HCFG.num_slots}")
     log(f"  embed_dim      : {HCFG.embed_dim} | route_dim {HCFG.route_dim} | lambda_route {HCFG.lambda_route}")
+    log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
+    log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
+    loss_desc = (f"triplet(margin={HCFG.triplet_margin}, miner={HCFG.triplet_miner})"
+                 if HCFG.loss_type == "triplet" else f"supcon(tau={HCFG.temperature})")
+    log(f"  embed loss     : {loss_desc}")
     log("------------------------")
 
     # ── config snapshot tied to this run ──────────────────────────────────
@@ -138,7 +184,7 @@ def main():
         json.dump(cfg_snapshot, f, indent=2)
     log(f"Config snapshot -> {cfg_path}")
 
-    supcon = SupConLoss(temperature=HCFG.temperature)
+    embed_loss, miner = build_embed_loss(HCFG)        # SupCon or Triplet on z
     route_loss = RoutingConsistencyLoss(temperature=HCFG.route_temperature)
 
     def make_optim(stage):
@@ -151,6 +197,10 @@ def main():
         ], weight_decay=HCFG.weight_decay)
 
     optim = make_optim(1)
+    # Stage-1 scheduler spans the frozen warmup phase; rebuilt for Stage 2 below.
+    stage1_epochs = min(args.frozen_epochs, args.epochs)
+    sched = make_scheduler(optim, max(1, stage1_epochs),
+                           HCFG.warmup_epochs, HCFG.lr_schedule)
     best, stage = 0.0, 1
     train_log, test_log = [], []                       # per-epoch / per-eval logs
     train_csv = os.path.join(HCFG.results_dir, f"train_{run}.csv")
@@ -161,6 +211,9 @@ def main():
             stage = 2
             encoder.unfreeze_vit_blocks(args.finetune_blocks)
             optim = make_optim(2)
+            # Fresh cosine over the remaining (Stage-2) epochs, no warmup.
+            sched = make_scheduler(optim, max(1, args.epochs - args.frozen_epochs),
+                                   0, HCFG.lr_schedule)
             log(f"--- Stage 2 (epoch {epoch}): unfroze last {args.finetune_blocks} ViT blocks ---")
 
         encoder.train() if stage == 2 else encoder.eval()
@@ -171,9 +224,16 @@ def main():
             imgs = imgs.to(device)
             labels = labels.to(device)
             z, rho, _ = model(imgs)
-            sc = supcon(z, labels)
-            rt = route_loss(rho, labels)
-            loss = sc + HCFG.lambda_route * rt
+            if miner is not None:
+                sc = embed_loss(z, labels, miner(z, labels))
+            else:
+                sc = embed_loss(z, labels)
+            if rho is not None and HCFG.lambda_route > 0:
+                rt = route_loss(rho, labels)
+                loss = sc + HCFG.lambda_route * rt
+            else:
+                rt = torch.zeros((), device=z.device)
+                loss = sc
 
             optim.zero_grad()
             loss.backward()
@@ -192,18 +252,24 @@ def main():
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
         log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} (sc={tot_sc/n:.4f} rt={tot_rt/n:.4f})")
 
+        if sched is not None:
+            sched.step()
+
         # ── TEST every eval_every epochs (and last) ───────────────────────
         if epoch % args.eval_every == 0 or epoch == args.epochs:
             res = evaluate(model, loaders, args.dataset, device)
-            r1 = res["routerank"]["R@1"]
+            # Model-selection metric: routerank R@1 when available, else base R@1.
+            r1 = res["routerank"]["R@1"] if "routerank" in res else res["base"]["R@1"]
             test_row = {"epoch": epoch, "stage": stage}
             for tag in ("base", "routerank"):
-                for m, v in res[tag].items():
-                    test_row[f"{tag}.{m}"] = v
+                if tag in res:
+                    for m, v in res[tag].items():
+                        test_row[f"{tag}.{m}"] = v
             test_log.append(test_row)
             pd.DataFrame(test_log).to_csv(test_csv, index=False)  # incremental
             log(f"   [test] base     : " + " ".join(f"{m}={v}" for m, v in res["base"].items()))
-            log(f"   [test] routerank: " + " ".join(f"{m}={v}" for m, v in res["routerank"].items()))
+            if "routerank" in res:
+                log(f"   [test] routerank: " + " ".join(f"{m}={v}" for m, v in res["routerank"].items()))
 
             if r1 > best:
                 best = r1

@@ -26,6 +26,14 @@ class HyMSConfig:
     tl_heads:         int = 4       # TokenLearner attention heads
     # ViT contributes its 256 patch tokens; CNN contributes len(cnn_stages)*tokens_per_stage.
 
+    # ── Ablation switches ─────────────────────────────────────────────────
+    # Master on/off for each component. Defaults all True => pipeline behaves
+    # exactly like before. use_moe=False bypasses Soft MoE (Y=X), which also
+    # disables rho/routerank/route-loss automatically (see train/eval).
+    use_vit:  bool = True
+    use_cnn:  bool = True
+    use_moe:  bool = True
+
     # ── Soft MoE ──────────────────────────────────────────────────────────
     n_experts:        int = 8
     slots_per_expert: int = 4       # total slots S = n_experts * slots_per_expert
@@ -37,7 +45,13 @@ class HyMSConfig:
     dropout:     float = 0.1
 
     # ── Loss ──────────────────────────────────────────────────────────────
+    # Main embedding loss on z: "supcon" (Supervised Contrastive) or "triplet"
+    # (TripletMarginLoss, optionally with semihard mining) to match baselines
+    # that report "triploss". The routing loss on rho stays SupCon either way.
+    loss_type:         str   = "supcon"  # "supcon" | "triplet"
     temperature:       float = 0.07   # SupCon tau for z
+    triplet_margin:    float = 0.1    # margin for TripletMarginLoss (+ its miner)
+    triplet_miner:     bool  = True   # mine semihard triplets (TripletMarginMiner)
     route_temperature: float = 0.1    # SupCon tau for rho
     lambda_route:      float = 0.5    # weight of routing-consistency loss
 
@@ -55,6 +69,11 @@ class HyMSConfig:
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
     weight_decay:  float = 1e-4
+    # LR schedule: "cosine" decays LR to 0 over the run (preserves head:backbone
+    # ratio); "constant" keeps it flat (old behaviour). warmup_epochs applies a
+    # linear warmup at the very start of Stage 1.
+    lr_schedule:   str   = "cosine"   # "cosine" | "constant"
+    warmup_epochs: int   = 0
     feat_noise:    float = 0.0     # optional gaussian noise on tokens (0 = off)
     grad_clip:     float = 1.0
 

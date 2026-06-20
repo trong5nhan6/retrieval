@@ -19,15 +19,21 @@ import numpy as np
 # ── feature extraction ──────────────────────────────────────────────────────
 @torch.no_grad()
 def extract(model, loader, device):
-    """Returns Z [N,De], R [N,Dr], labels [N]."""
+    """Returns Z [N,De], R [N,Dr] (or None if model has no routing head), labels [N]."""
     model.eval()
     Z, Rr, Y = [], [], []
+    has_rho = True
     for batch in loader:
         imgs, labels = batch[0], batch[1]
         z, rho, _ = model(imgs.to(device))
-        Z.append(z.cpu()); Rr.append(rho.cpu())
+        Z.append(z.cpu())
+        if rho is None:
+            has_rho = False
+        else:
+            Rr.append(rho.cpu())
         Y.append(labels if isinstance(labels, torch.Tensor) else torch.tensor(labels))
-    return torch.cat(Z), torch.cat(Rr), torch.cat(Y)
+    R = torch.cat(Rr) if has_rho else None
+    return torch.cat(Z), R, torch.cat(Y)
 
 
 # ── core fusion ─────────────────────────────────────────────────────────────
@@ -119,7 +125,7 @@ def evaluate_self(model, loader, device, cfg, use_routerank=True, recall_k=None)
     rk = recall_k or cfg.recall_k
     Z, R, Y = extract(model, loader, device)
     base = _metrics_from_sim(Z @ Z.T, Y, Y, rk, exclude_self=True)
-    if not use_routerank:
+    if not use_routerank or R is None:      # no routing fingerprint -> base only
         return {"base": base}
     S = routerank_sim(Z, R, Z, R, cfg.rr_beta, cfg.rr_topk, cfg.rr_alpha,
                       cfg.rr_reroute, self_retrieval=True)
@@ -135,7 +141,7 @@ def evaluate_query_gallery(model, query_loader, gallery_loader, device, cfg,
     Zq, Rq, Yq = extract(model, query_loader, device)
     Zg, Rg, Yg = extract(model, gallery_loader, device)
     base = _metrics_from_sim(Zq @ Zg.T, Yq, Yg, rk, exclude_self=False)
-    if not use_routerank:
+    if not use_routerank or Rq is None or Rg is None:   # no fingerprint -> base only
         return {"base": base}
     S = routerank_sim(Zq, Rq, Zg, Rg, cfg.rr_beta, cfg.rr_topk, cfg.rr_alpha,
                       cfg.rr_reroute, self_retrieval=False)
