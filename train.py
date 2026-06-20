@@ -279,6 +279,18 @@ def main():
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
 
     log(f"Done. Best R@1={best:.2f}")
+
+    # ── auto-plot test metrics + train loss -> results/plot_*_{run}.png ────
+    try:
+        from plot_test_metrics import plot_test_metrics, plot_train_loss
+        test_png = os.path.join(HCFG.results_dir, f"plot_test_{run}.png")
+        plot_test_metrics(test_csv, out=test_png, title=f"Test-metric trends — {run}")
+        loss_png = os.path.join(HCFG.results_dir, f"plot_train_{run}.png")
+        plot_train_loss(train_csv, out=loss_png, title=f"Training loss — {run}")
+        log(f"Plots: {test_png} | {loss_png}")
+    except Exception as e:                       # never let plotting break a finished run
+        log(f"[plot] skipped ({type(e).__name__}: {e})")
+
     log(f"Logs: {log_path} | train: {train_csv} | test: {test_csv} | config: {cfg_path}")
     log_f.close()
 

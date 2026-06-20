@@ -38,16 +38,18 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
-    args = parse_args()
-    run = f"hyms_{args.dataset}_seed{args.seed}"
-    csv_path = args.csv or os.path.join(args.results_dir, f"test_{run}.csv")
+def plot_test_metrics(csv_path, out=None, metrics=None, channels=None, title=None):
+    """Render test-metric trends from a test_{run}.csv to a PNG. Returns out path."""
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"test CSV not found: {csv_path}")
+    metrics = metrics or list(DEFAULT_METRICS)
+    channels = channels or ["base", "routerank"]
+    if isinstance(metrics, str):
+        metrics = [m.strip() for m in metrics.split(",") if m.strip()]
+    if isinstance(channels, str):
+        channels = [c.strip() for c in channels.split(",") if c.strip()]
 
     df = pd.read_csv(csv_path).sort_values("epoch")
-    metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
-    channels = [c.strip() for c in args.channels.split(",") if c.strip()]
 
     cmap = plt.get_cmap("tab10")
     color = {m: cmap(i % 10) for i, m in enumerate(metrics)}
@@ -87,15 +89,74 @@ def main():
 
     ax.set_xlabel("epoch")
     ax.set_ylabel("metric (%)")
-    ax.set_title(f"Test-metric trends — {run}")
+    ax.set_title(title or "Test-metric trends")
     ax.grid(True, alpha=0.3)
     ax.legend(ncol=2, fontsize=8, loc="lower left")
     fig.tight_layout()
 
-    out = args.out or os.path.join(args.results_dir, f"plot_test_{run}.png")
+    if out is None:
+        out = os.path.splitext(csv_path)[0] + ".png"
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     fig.savefig(out, dpi=150)
-    print(f"saved {out}")
+    plt.close(fig)
+    return out
+
+
+def plot_train_loss(csv_path, out=None, title=None):
+    """Render training-loss curves from a train_{run}.csv to a PNG.
+
+    Plots total loss and its components: sc (embedding loss on z) and route
+    (routing-consistency loss on rho). Returns out path."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"train CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path).sort_values("epoch")
+
+    series = [("loss", "total loss", "tab:red"),
+              ("sc", "sc  (embedding loss)", "tab:blue"),
+              ("route", "route  (routing loss)", "tab:green")]
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+    for col, lbl, c in series:
+        if col in df.columns and not df[col].isna().all():
+            ax.plot(df["epoch"], df[col], "-", lw=1.8, color=c, label=lbl)
+
+    if "stage" in df.columns and (df["stage"] == 2).any():
+        s2 = df.loc[df["stage"] == 2, "epoch"].min()
+        ax.axvline(s2, color="grey", ls=":", lw=1)
+        ax.text(s2, ax.get_ylim()[1], " Stage 2", va="top", ha="left",
+                fontsize=8, color="grey")
+
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("train loss")
+    ax.set_title(title or "Training loss")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
+    fig.tight_layout()
+
+    if out is None:
+        out = os.path.splitext(csv_path)[0] + "_loss.png"
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    fig.savefig(out, dpi=150)
+    plt.close(fig)
+    return out
+
+
+def main():
+    args = parse_args()
+    run = f"hyms_{args.dataset}_seed{args.seed}"
+    csv_path = args.csv or os.path.join(args.results_dir, f"test_{run}.csv")
+    out = args.out or os.path.join(args.results_dir, f"plot_test_{run}.png")
+    saved = plot_test_metrics(csv_path, out=out, metrics=args.metrics,
+                              channels=args.channels, title=f"Test-metric trends — {run}")
+    print(f"saved {saved}")
+
+    # also plot the training-loss curve if the matching train CSV exists
+    train_csv = os.path.join(args.results_dir, f"train_{run}.csv")
+    if os.path.exists(train_csv):
+        saved_loss = plot_train_loss(train_csv,
+                                     out=os.path.join(args.results_dir, f"plot_train_{run}.png"),
+                                     title=f"Training loss — {run}")
+        print(f"saved {saved_loss}")
 
 
 if __name__ == "__main__":
