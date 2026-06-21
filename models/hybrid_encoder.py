@@ -12,6 +12,7 @@ Freezing:
   freeze_all()                      -> both backbones frozen
   unfreeze_vit_blocks(n)            -> last n DINOv2 blocks + final norm trainable
 """
+import os
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,31 @@ import torch.nn as nn
 def _set_requires_grad(module: nn.Module, value: bool):
     for p in module.parameters():
         p.requires_grad_(value)
+
+
+def _load_cnn_ssl_ckpt(cnn: nn.Module):
+    """Optionally warm-start the CNN from a self-supervised (SSL) checkpoint.
+
+    If the env var HYMS_CNN_CKPT points to a readable file, load it into `cnn`
+    with strict=False. The checkpoint may be a raw torchvision convnext
+    state_dict, or a dict wrapping it under the key 'cnn' / 'model' / 'state_dict'.
+    Set by notebooks/convnext_fintune.ipynb after SSL pretraining. No-op if unset.
+    """
+    path = os.environ.get("HYMS_CNN_CKPT", "").strip()
+    if not path:
+        return
+    if not os.path.exists(path):
+        print(f"[HybridEncoder] HYMS_CNN_CKPT set but not found: {path} — skipping.")
+        return
+    sd = torch.load(path, map_location="cpu")
+    if isinstance(sd, dict):
+        for k in ("cnn", "model", "state_dict"):
+            if k in sd and isinstance(sd[k], dict):
+                sd = sd[k]
+                break
+    missing, unexpected = cnn.load_state_dict(sd, strict=False)
+    print(f"[HybridEncoder] loaded SSL CNN weights from {path} "
+          f"(missing={len(missing)}, unexpected={len(unexpected)})")
 
 
 class HybridEncoder(nn.Module):
@@ -50,6 +76,7 @@ class HybridEncoder(nn.Module):
         if use_cnn:
             cnn_fn = getattr(tvm, cnn_name)
             self.cnn = cnn_fn(weights="DEFAULT")
+            _load_cnn_ssl_ckpt(self.cnn)               # optional SSL warm-start (HYMS_CNN_CKPT)
             self.cnn_features = self.cnn.features      # Sequential
             # channel dims of the 4 stages (convnext_tiny): 96,192,384,768
             self.cnn_stage_dims = self._infer_stage_dims()
