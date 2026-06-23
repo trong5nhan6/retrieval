@@ -22,8 +22,8 @@ class HyMSConfig:
 
     # ── Token assembly ────────────────────────────────────────────────────
     token_dim:        int = 768     # common token dim d (both branches projected to this)
-    tokens_per_stage: int = 64      # TokenLearner output tokens per CNN stage
-    tl_heads:         int = 4       # TokenLearner attention heads
+    tokens_per_stage: int = 64      # LocalTokenizer tokens/stage (PHẢI là số chính phương: lưới g×g)
+    tl_heads:         int = 4       # (deprecated) cũ dùng cho cross-attention TokenLearner; LocalTokenizer bỏ qua
     # ViT contributes its 256 patch tokens; CNN contributes len(cnn_stages)*tokens_per_stage.
 
     # ── Ablation switches ─────────────────────────────────────────────────
