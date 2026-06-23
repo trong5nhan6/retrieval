@@ -129,6 +129,20 @@ def _parse_cub(root):
     return {"train": train, "test": test}, 100
 
 
+def _find_cars_split_dir(root, split):
+    """Locate the per-split image folder, tolerating layout variants.
+
+    Kaggle ships 'car_data/car_data/<split>/', but some mirrors flatten it to
+    'car_data/<split>/' or '<split>/'. Return the first that exists.
+    """
+    for cand in (os.path.join(root, "car_data", "car_data", split),
+                 os.path.join(root, "car_data", split),
+                 os.path.join(root, split)):
+        if os.path.isdir(cand):
+            return cand
+    return None
+
+
 def _parse_cars(root):
     """Cars196 — Kaggle CSV layout (preferred) with .mat fallback.
 
@@ -137,6 +151,17 @@ def _parse_cars(root):
     follow the standard zero-shot retrieval protocol (classes 1..98 train,
     99..196 test).
     """
+    # Auto-detect an extra nested level (e.g. the upload places everything under
+    # Cars196/Cars196/ or Cars196/cars196/), like _parse_cub does for CUB.
+    if not (os.path.exists(os.path.join(root, "anno_train.csv")) or
+            os.path.exists(os.path.join(root, "cars_annos.mat"))):
+        for sub in ("Cars196", "cars196"):
+            nested = os.path.join(root, sub)
+            if (os.path.exists(os.path.join(nested, "anno_train.csv")) or
+                    os.path.exists(os.path.join(nested, "cars_annos.mat"))):
+                root = nested
+                break
+
     csv_train = os.path.join(root, "anno_train.csv")
     if os.path.exists(csv_train):
         import csv as _csv
@@ -148,7 +173,12 @@ def _parse_cars(root):
         items_all = []
         for split, csv_name in (("train", "anno_train.csv"),
                                 ("test", "anno_test.csv")):
-            split_dir = os.path.join(root, "car_data", "car_data", split)
+            split_dir = _find_cars_split_dir(root, split)
+            if split_dir is None:
+                raise FileNotFoundError(
+                    f"Cars196: could not find the '{split}' image folder under "
+                    f"{root!r} (looked for car_data/car_data/{split}, "
+                    f"car_data/{split}, {split}).")
             with open(os.path.join(root, csv_name)) as f:
                 for row in _csv.reader(f):
                     if not row:
@@ -156,7 +186,7 @@ def _parse_cars(root):
                     fname, cls = row[0], int(row[-1])      # 'file,x1,y1,x2,y2,class'
                     ap = os.path.join(split_dir, class_names[cls - 1], fname)
                     items_all.append((ap, cls))
-    else:
+    elif os.path.exists(os.path.join(root, "cars_annos.mat")):
         import scipy.io as sio
         anno = sio.loadmat(os.path.join(root, "cars_annos.mat"))["annotations"][0]
         items_all = []
@@ -164,6 +194,12 @@ def _parse_cars(root):
             rel = str(a[0][0])                              # e.g. 'car_ims/000001.jpg'
             cls = int(a[5][0][0])                           # 1..196
             items_all.append((os.path.join(root, rel), cls))
+    else:
+        raise FileNotFoundError(
+            f"Cars196: no 'anno_train.csv' (Kaggle CSV layout) and no "
+            f"'cars_annos.mat' (Stanford layout) found under {root!r}. "
+            f"Check cfg.data_roots['cars'] — it must point at the directory that "
+            f"directly contains those files.")
 
     train = [(p, c - 1) for p, c in items_all if c <= 98]
     test = [(p, c - 1) for p, c in items_all if c > 98]
