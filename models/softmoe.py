@@ -21,7 +21,9 @@ class _Expert(nn.Module):
     def __init__(self, dim: int, hidden: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, hidden), nn.LayerNorm(hidden), nn.GELU(),
+            nn.Linear(dim, hidden), 
+            nn.LayerNorm(hidden), 
+            nn.GELU(),
             nn.Linear(hidden, dim),
         )
 
