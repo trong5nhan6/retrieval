@@ -63,7 +63,7 @@ def apply_overrides(cfg):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop"])
+    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop", "sop"])
     p.add_argument("--epochs", type=int, default=HCFG.epochs)
     p.add_argument("--frozen_epochs", type=int, default=HCFG.frozen_epochs)
     p.add_argument("--finetune_blocks", type=int, default=HCFG.finetune_blocks)
@@ -82,7 +82,7 @@ def evaluate(model, loaders, dataset, device):
         torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
     use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
-    if dataset in ("cub", "cars"):
+    if dataset in ("cub", "cars", "sop"):
         return evaluate_self(model, loaders["test"], device, HCFG,
                              use_routerank=use_rr, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],

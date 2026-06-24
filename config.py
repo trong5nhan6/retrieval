@@ -115,6 +115,7 @@ class HyMSConfig:
         "cub":    "datasets/CUB_200_2011",
         "cars":   "datasets/Cars196",
         "inshop": "datasets/In-shop Clothes Retrieval Benchmark",
+        "sop":    "datasets/Stanford_Online_Products",
     })
 
     @property
