@@ -74,6 +74,7 @@ class HyMSConfig:
     epochs:        int   = 60
     frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
+    finetune_cnn_stages: int = 0   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
     weight_decay:  float = 1e-4
