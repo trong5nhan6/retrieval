@@ -9,3 +9,4 @@ figures/
 *.pt
 *.pth
 .DS_Store
+paper write/
