@@ -11,6 +11,7 @@ in the full model (models/hyms_route.py).
 Freezing:
   freeze_all()                      -> both backbones frozen
   unfreeze_vit_blocks(n)            -> last n DINOv2 blocks + final norm trainable
+  unfreeze_cnn_stages(n)            -> last n ConvNeXt stages (+ their downsample) trainable
 """
 import os
 import torch
@@ -109,6 +110,21 @@ class HybridEncoder(nn.Module):
         for layer in self.vit.encoder.layer[-n_blocks:]:
             _set_requires_grad(layer, True)
         _set_requires_grad(self.vit.layernorm, True)
+
+    def unfreeze_cnn_stages(self, n_stages: int = 2):
+        """Unfreeze the last n ConvNeXt stages (and the downsample feeding them).
+
+        `_CONVNEXT_STAGE_IDX = [1, 3, 5, 7]` are the stage indices inside
+        `cnn_features`; the even indices in between are downsample layers. To
+        train the last n stages we unfreeze everything from the downsample that
+        precedes the first selected stage onward (n_stages=4 => whole backbone).
+        """
+        if n_stages <= 0 or self.cnn_features is None:
+            return
+        first_stage = self._CONVNEXT_STAGE_IDX[-n_stages:][0]
+        start = max(0, first_stage - 1)               # include preceding downsample/stem
+        for layer in self.cnn_features[start:]:
+            _set_requires_grad(layer, True)
 
     def trainable_backbone_parameters(self):
         return [p for p in self.parameters() if p.requires_grad]

@@ -18,7 +18,7 @@ import torch.nn.functional as F
 
 from config import HCFG
 from models.hybrid_encoder import HybridEncoder
-from models.token_learner import TokenLearner
+from models.token_learner import LocalTokenizer
 from models.softmoe import SoftMoE
 
 
@@ -56,14 +56,16 @@ class HyMSRoute(nn.Module):
         # ── ViT projection (768 -> d) ────────────────────────────────────
         self.vit_proj = nn.Linear(encoder.vit_dim, d) if self.use_vit else None
 
-        # ── per CNN stage: 1x1 conv (C_s -> d) + TokenLearner ────────────
+        # ── per CNN stage: 1x1 conv (C_s -> d) + LocalTokenizer ──────────
+        # LocalTokenizer giữ tính cục bộ: mỗi token = một vùng lưới g×g của
+        # feature map (không cross-attention/pool toàn cục như trước).
         self.cnn_proj = nn.ModuleList()
         self.token_learners = nn.ModuleList()
         for s in self.cnn_stages:
             c_in = encoder.cnn_stage_dims[s]
             self.cnn_proj.append(nn.Conv2d(c_in, d, kernel_size=1))
             self.token_learners.append(
-                TokenLearner(d, num_tokens=cfg.tokens_per_stage, num_heads=cfg.tl_heads))
+                LocalTokenizer(d, num_tokens=cfg.tokens_per_stage))
 
         # ── scale / branch embeddings: 1 for ViT (if on) + 1 per CNN stage ─
         n_sources = (1 if self.use_vit else 0) + len(self.cnn_stages)

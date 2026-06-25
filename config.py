@@ -22,8 +22,8 @@ class HyMSConfig:
 
     # ── Token assembly ────────────────────────────────────────────────────
     token_dim:        int = 768     # common token dim d (both branches projected to this)
-    tokens_per_stage: int = 64      # TokenLearner output tokens per CNN stage
-    tl_heads:         int = 4       # TokenLearner attention heads
+    tokens_per_stage: int = 64      # LocalTokenizer tokens/stage (PHẢI là số chính phương: lưới g×g)
+    tl_heads:         int = 4       # (deprecated) cũ dùng cho cross-attention TokenLearner; LocalTokenizer bỏ qua
     # ViT contributes its 256 patch tokens; CNN contributes len(cnn_stages)*tokens_per_stage.
 
     # ── Ablation switches ─────────────────────────────────────────────────
@@ -74,6 +74,7 @@ class HyMSConfig:
     epochs:        int   = 60
     frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
+    finetune_cnn_stages: int = 0   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
     weight_decay:  float = 1e-4
@@ -114,6 +115,7 @@ class HyMSConfig:
         "cub":    "datasets/CUB_200_2011",
         "cars":   "datasets/Cars196",
         "inshop": "datasets/In-shop Clothes Retrieval Benchmark",
+        "sop":    "datasets/Stanford_Online_Products",
     })
 
     @property

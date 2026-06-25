@@ -109,7 +109,7 @@ def build_loss(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop"])
+    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop", "sop"])
     p.add_argument("--vit_name", default=HCFG.vit_name)
     p.add_argument("--pool", default="cls", choices=["cls", "mean", "cls_mean"])
     p.add_argument("--embed_dim", type=int, default=512, help="<=0 => no projection")
@@ -131,7 +131,7 @@ def parse_args():
 def evaluate(model, loaders, dataset, device):
     rk = HCFG.recall_k_for(dataset)
     # use_routerank=False: this baseline has no routing fingerprint
-    if dataset in ("cub", "cars"):
+    if dataset in ("cub", "cars", "sop"):
         return evaluate_self(model, loaders["test"], device, HCFG,
                              use_routerank=False, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],

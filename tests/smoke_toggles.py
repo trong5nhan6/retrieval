@@ -52,6 +52,9 @@ class FakeEncoder(nn.Module):
     def unfreeze_vit_blocks(self, n):
         pass
 
+    def unfreeze_cnn_stages(self, n):
+        pass
+
     def trainable_backbone_parameters(self):
         return []
 

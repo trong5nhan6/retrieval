@@ -28,6 +28,10 @@ ship in `datasets/`:
     Eval/list_eval_partition.txt   (root-level file is also accepted)
     Img/img/<...>.jpg              (extract Img/img.zip first!)
 
+  Stanford_Online_Products/        (a nested Stanford_Online_Products/ is auto-detected)
+    Ebay_train.txt / Ebay_test.txt 'image_id class_id super_class_id path' (+header)
+    <cat>_final/<file>.JPG
+
 Usage:
   from data.dml_dataset import get_dml_loaders
   loaders = get_dml_loaders("cub", HCFG)        # dict
@@ -206,22 +210,40 @@ def _parse_cars(root):
     return {"train": train, "test": test}, 98
 
 
+def _resolve_inshop_img_root(root, sample_rel):
+    """Find the base dir under which `sample_rel` ('img/...') resolves.
+
+    Different unzip flows nest the images differently: 'img/' may sit at the
+    dataset root, under 'Img/', or wrapped in one-or-more extra 'img/' levels
+    (e.g. Img/img/img/WOMEN/...). Probe each base and descend through extra
+    'img/' wrappers until the sample image actually exists on disk.
+    """
+    for base in (root, os.path.join(root, "Img"), os.path.join(root, "img")):
+        cur = base
+        for _ in range(4):                       # tolerate up to a few extra 'img/' levels
+            if os.path.isfile(os.path.join(cur, sample_rel)):
+                return cur
+            nxt = os.path.join(cur, "img")
+            if not os.path.isdir(nxt):
+                break
+            cur = nxt
+    return root                                  # fall back (will surface a clear FileNotFound)
+
+
 def _parse_inshop(root):
     # Partition file may sit at the root or under Eval/.
     part = os.path.join(root, "list_eval_partition.txt")
     if not os.path.exists(part):
         part = os.path.join(root, "Eval", "list_eval_partition.txt")
-    # Image paths in the partition file are 'img/...'; locate the dir holding 'img/'.
-    img_root = root
-    for cand in (root, os.path.join(root, "Img")):
-        if os.path.isdir(os.path.join(cand, "img")):
-            img_root = cand
-            break
 
     train, query, gallery = [], [], []
     label_map = {}
     with open(part) as f:
         lines = f.read().splitlines()
+    # Image paths in the partition file are 'img/...'; resolve the base dir that
+    # makes them exist (tolerates extra nested 'img/' levels from unzip).
+    sample_rel = next((l.split()[0] for l in lines[2:] if l.split()), "")
+    img_root = _resolve_inshop_img_root(root, sample_rel)
     # first line = count, second = header
     for l in lines[2:]:
         parts = l.split()
@@ -241,7 +263,47 @@ def _parse_inshop(root):
     return {"train": train, "query": query, "gallery": gallery}, len(label_map)
 
 
-_PARSERS = {"cub": _parse_cub, "cars": _parse_cars, "inshop": _parse_inshop}
+def _parse_sop(root):
+    """Stanford Online Products — official Ebay_train / Ebay_test split.
+
+    Files (one extra nested level is auto-detected):
+      Ebay_train.txt / Ebay_test.txt : header line then rows
+                                       'image_id class_id super_class_id path'
+      <cat>_final/<file>.JPG         : images, path is relative to the dir
+                                       holding the txt files
+
+    Train (class_id 1..11318) and test (11319..22634) are disjoint product
+    instances — the standard zero-shot retrieval protocol, so we use the splits
+    as shipped. class_id is remapped to contiguous 0-based labels per split.
+    Test is a single gallery (query == gallery), like CUB/Cars.
+    """
+    # Auto-detect the extra nested Stanford_Online_Products/ level (like CUB/Cars).
+    if not os.path.exists(os.path.join(root, "Ebay_train.txt")):
+        nested = os.path.join(root, "Stanford_Online_Products")
+        if os.path.exists(os.path.join(nested, "Ebay_train.txt")):
+            root = nested
+
+    def _read(split_file):
+        items, label_map = [], {}
+        with open(os.path.join(root, split_file)) as f:
+            next(f)                                    # skip header row
+            for l in f:
+                parts = l.split()
+                if len(parts) < 4:
+                    continue
+                cls, rel = int(parts[1]), parts[3]     # class_id, '<cat>_final/<file>.JPG'
+                if cls not in label_map:
+                    label_map[cls] = len(label_map)    # contiguous 0-based
+                items.append((os.path.join(root, rel), label_map[cls]))
+        return items, len(label_map)
+
+    train, n_train = _read("Ebay_train.txt")
+    test, _ = _read("Ebay_test.txt")
+    return {"train": train, "test": test}, n_train
+
+
+_PARSERS = {"cub": _parse_cub, "cars": _parse_cars,
+            "inshop": _parse_inshop, "sop": _parse_sop}
 
 
 # ── public API ──────────────────────────────────────────────────────────────
@@ -262,7 +324,7 @@ def get_dml_loaders(name: str, cfg):
         sampler=sampler, num_workers=_NUM_WORKERS, pin_memory=True, drop_last=True)
 
     # eval loaders
-    eval_splits = ["test"] if name in ("cub", "cars") else ["query", "gallery"]
+    eval_splits = ["test"] if name in ("cub", "cars", "sop") else ["query", "gallery"]
     for sp in eval_splits:
         ds = _ListDataset(splits[sp], cfg.image_size, train=False)
         loaders[sp] = DataLoader(ds, batch_size=128, shuffle=False,

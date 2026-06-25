@@ -63,10 +63,11 @@ def apply_overrides(cfg):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop"])
+    p.add_argument("--dataset", required=True, choices=["cub", "cars", "inshop", "sop"])
     p.add_argument("--epochs", type=int, default=HCFG.epochs)
     p.add_argument("--frozen_epochs", type=int, default=HCFG.frozen_epochs)
     p.add_argument("--finetune_blocks", type=int, default=HCFG.finetune_blocks)
+    p.add_argument("--finetune_cnn_stages", type=int, default=HCFG.finetune_cnn_stages)
     p.add_argument("--head_lr", type=float, default=HCFG.head_lr)
     p.add_argument("--backbone_lr", type=float, default=HCFG.backbone_lr)
     p.add_argument("--lambda_route", type=float, default=HCFG.lambda_route)
@@ -81,7 +82,7 @@ def evaluate(model, loaders, dataset, device):
         torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
     use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
-    if dataset in ("cub", "cars"):
+    if dataset in ("cub", "cars", "sop"):
         return evaluate_self(model, loaders["test"], device, HCFG,
                              use_routerank=use_rr, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],
@@ -161,7 +162,7 @@ def main():
     log("----- Tham số chạy -----")
     log(f"  total params   : {total_params:,}")
     log(f"  trainable params: {train_params:,} (head {n_head:,})")
-    log(f"  epochs         : {args.epochs} (frozen {args.frozen_epochs}, finetune_blocks {args.finetune_blocks})")
+    log(f"  epochs         : {args.epochs} (frozen {args.frozen_epochs}, finetune_blocks {args.finetune_blocks}, finetune_cnn_stages {args.finetune_cnn_stages})")
     log(f"  lr             : head {args.head_lr} | backbone {args.backbone_lr}")
     log(f"  batch_size     : {HCFG.classes_per_batch * HCFG.samples_per_class} "
         f"(classes_per_batch {HCFG.classes_per_batch} x samples_per_class {HCFG.samples_per_class})")
@@ -180,6 +181,7 @@ def main():
     cfg_snapshot.update({"run": run, "dataset": args.dataset, "seed": args.seed,
                          "epochs": args.epochs, "frozen_epochs": args.frozen_epochs,
                          "finetune_blocks": args.finetune_blocks,
+                         "finetune_cnn_stages": args.finetune_cnn_stages,
                          "head_lr": args.head_lr, "backbone_lr": args.backbone_lr,
                          "eval_every": args.eval_every,
                          "recall_k": HCFG.recall_k_for(args.dataset),
@@ -216,11 +218,13 @@ def main():
         if stage == 1 and epoch > args.frozen_epochs:
             stage = 2
             encoder.unfreeze_vit_blocks(args.finetune_blocks)
+            encoder.unfreeze_cnn_stages(args.finetune_cnn_stages)
             optim = make_optim(2)
             # Fresh cosine over the remaining (Stage-2) epochs, no warmup.
             sched = make_scheduler(optim, max(1, args.epochs - args.frozen_epochs),
                                    0, HCFG.lr_schedule)
-            log(f"--- Stage 2 (epoch {epoch}): unfroze last {args.finetune_blocks} ViT blocks ---")
+            log(f"--- Stage 2 (epoch {epoch}): unfroze last {args.finetune_blocks} ViT blocks "
+                f"+ {args.finetune_cnn_stages} CNN stages ---")
 
         encoder.train() if stage == 2 else encoder.eval()
         model.train()
