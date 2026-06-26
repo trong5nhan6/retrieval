@@ -74,6 +74,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=HCFG.seed)
     p.add_argument("--eval_every", type=int, default=HCFG.eval_every,
                    help="run test every N epochs (default from config: HCFG.eval_every)")
+    p.add_argument("--run_id", type=str, default="",
+                   help="custom run identifier (default: timestamp YYYYMMDD_HHMMSS)")
     return p.parse_args()
 
 
@@ -131,14 +133,22 @@ def main():
     if not HCFG.use_moe:
         HCFG.lambda_route = 0.0
     set_seed(args.seed)
-    os.makedirs(HCFG.checkpoint_dir, exist_ok=True)
     os.makedirs(HCFG.results_dir, exist_ok=True)
-    os.makedirs(HCFG.log_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run = f"hyms_{args.dataset}_seed{args.seed}"
 
-    # ── logger: console + results/logs/{run}.log ──────────────────────────
-    log_path = os.path.join(HCFG.log_dir, f"{run}.log")
+    run_id = args.run_id if args.run_id else datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run = f"hyms_{args.dataset}_seed{args.seed}_{run_id}"
+
+    # Thư mục riêng cho lần chạy này; mỗi run không đè lên nhau.
+    run_dir  = os.path.join(HCFG.results_dir, run)
+    ckpt_dir = os.path.join(run_dir, "checkpoints")
+    log_dir  = os.path.join(run_dir, "logs")
+    os.makedirs(run_dir, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    # ── logger: console + <run_dir>/logs/train.log ────────────────────────
+    log_path = os.path.join(log_dir, "train.log")
     log_f = open(log_path, "a", encoding="utf-8")
     def log(msg=""):
         print(msg)
@@ -147,6 +157,17 @@ def main():
     log(f"\n===== {run} @ {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====")
     log(f"device={device} | dataset={args.dataset} | seed={args.seed} | eval_every={args.eval_every}")
     loaders = get_dml_loaders(args.dataset, HCFG)
+
+    # ── thông tin dataset ──────────────────────────────────────────────────
+    n_train_imgs    = len(loaders['train'].dataset)
+    n_train_classes = len(set(lbl for _, lbl in loaders['train'].dataset.items))
+    eval_key        = 'test' if args.dataset in ('cub', 'cars', 'sop') else 'query'
+    n_eval_imgs     = len(loaders[eval_key].dataset)
+    gallery_str     = (f", {len(loaders['gallery'].dataset)} gallery imgs"
+                       if 'gallery' in loaders else "")
+    log(f"Dataset      : {args.dataset.upper()} | root: {HCFG.data_roots[args.dataset]}")
+    log(f"  train      : {n_train_classes} classes, {n_train_imgs} imgs")
+    log(f"  {eval_key:<8}: {n_eval_imgs} imgs{gallery_str}")
     log(f"Train batches/epoch: {len(loaders['train'])}")
 
     encoder = HybridEncoder(HCFG.vit_name, HCFG.cnn_name, device,
@@ -186,8 +207,14 @@ def main():
                          "eval_every": args.eval_every,
                          "recall_k": HCFG.recall_k_for(args.dataset),
                          "n_head_params": n_head,
+                         "data_root": HCFG.data_roots[args.dataset],
+                         "n_train_classes": n_train_classes,
+                         "n_train_imgs": n_train_imgs,
+                         f"n_{eval_key}_imgs": n_eval_imgs,
+                         **({"n_gallery_imgs": len(loaders['gallery'].dataset)}
+                            if 'gallery' in loaders else {}),
                          "timestamp": datetime.datetime.now().isoformat()})
-    cfg_path = os.path.join(HCFG.log_dir, f"{run}_config.json")
+    cfg_path = os.path.join(log_dir, "config.json")
     with open(cfg_path, "w") as f:
         json.dump(cfg_snapshot, f, indent=2)
     log(f"Config snapshot -> {cfg_path}")
@@ -211,8 +238,8 @@ def main():
                            HCFG.warmup_epochs, HCFG.lr_schedule)
     best, stage = 0.0, 1
     train_log, test_log = [], []                       # per-epoch / per-eval logs
-    train_csv = os.path.join(HCFG.results_dir, f"train_{run}.csv")
-    test_csv  = os.path.join(HCFG.results_dir, f"test_{run}.csv")
+    train_csv = os.path.join(run_dir, "train.csv")
+    test_csv  = os.path.join(run_dir, "test.csv")
 
     for epoch in range(1, args.epochs + 1):
         if stage == 1 and epoch > args.frozen_epochs:
@@ -289,7 +316,7 @@ def main():
 
             if r1 > best:
                 best = r1
-                ckpt = os.path.join(HCFG.checkpoint_dir, f"best_{run}.pt")
+                ckpt = os.path.join(ckpt_dir, "best.pt")
                 torch.save({"model": model.state_dict(), "epoch": epoch, "R@1": best,
                             "config": cfg_snapshot}, ckpt)
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
@@ -303,14 +330,15 @@ def main():
     # ── auto-plot test metrics + train loss -> results/plot_*_{run}.png ────
     try:
         from plot_test_metrics import plot_test_metrics, plot_train_loss
-        test_png = os.path.join(HCFG.results_dir, f"plot_test_{run}.png")
+        test_png = os.path.join(run_dir, "plot_test.png")
         plot_test_metrics(test_csv, out=test_png, title=f"Test-metric trends — {run}")
-        loss_png = os.path.join(HCFG.results_dir, f"plot_train_{run}.png")
+        loss_png = os.path.join(run_dir, "plot_train.png")
         plot_train_loss(train_csv, out=loss_png, title=f"Training loss — {run}")
         log(f"Plots: {test_png} | {loss_png}")
     except Exception as e:                       # never let plotting break a finished run
         log(f"[plot] skipped ({type(e).__name__}: {e})")
 
+    log(f"Run dir: {run_dir}")
     log(f"Logs: {log_path} | train: {train_csv} | test: {test_csv} | config: {cfg_path}")
     log_f.close()
 
