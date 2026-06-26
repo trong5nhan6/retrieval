@@ -72,7 +72,7 @@ class HyMSConfig:
     # ── Training ──────────────────────────────────────────────────────────
     batch_size:    int   = 128     # class-balanced sampler (see data loader)
     epochs:        int   = 10
-    frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
+    frozen_epochs: int   = 2       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
     finetune_cnn_stages: int = 2   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
@@ -91,7 +91,7 @@ class HyMSConfig:
     samples_per_class:    int = 6   # batch_size ~= classes_per_batch * samples_per_class
 
     # ── Eval / logging ────────────────────────────────────────────────────
-    eval_every: int = 5     # run test every N train epochs (also always at last epoch)
+    eval_every: int = 2     # run test every N train epochs (also always at last epoch)
     log_dir:    str = "results/logs"
     # Default K (CUB/Cars). Per-dataset K below follows each benchmark's SOTA tables.
     recall_k: List[int] = field(default_factory=lambda: [1, 2, 4, 8])

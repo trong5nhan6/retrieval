@@ -13,9 +13,12 @@ Usage:
   python train_dml.py --dataset cars  --epochs 80 --seed 0
   python train_dml.py --dataset inshop --finetune_blocks 0
 
-Outputs:
-  results/checkpoints/best_hyms_{dataset}_seed{seed}.pt
-  results/history_hyms_{dataset}_seed{seed}.csv
+Outputs (per run):
+  results/{dataset}/{timestamp}_seed{N}_{flags}/best.pt
+  results/{dataset}/{timestamp}_seed{N}_{flags}/train.csv
+  results/{dataset}/{timestamp}_seed{N}_{flags}/test.csv
+  results/{dataset}/{timestamp}_seed{N}_{flags}/config.json
+  results/{dataset}/{timestamp}_seed{N}_{flags}/run.log
 """
 import os, argparse, json, dataclasses, datetime, math
 # Reduce CUDA fragmentation (must be set BEFORE torch initializes CUDA).
@@ -133,23 +136,18 @@ def main():
     if not HCFG.use_moe:
         HCFG.lambda_route = 0.0
     set_seed(args.seed)
-    os.makedirs(HCFG.results_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_id = args.run_id if args.run_id else datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run = f"hyms_{args.dataset}_seed{args.seed}_{run_id}"
-
-    # Thư mục riêng cho lần chạy này; mỗi run không đè lên nhau.
-    run_dir  = os.path.join(HCFG.results_dir, run)
-    ckpt_dir = os.path.join(run_dir, "checkpoints")
-    log_dir  = os.path.join(run_dir, "logs")
+    # ── run directory: results/{dataset}/{timestamp}_seed{N}_{active_flags} ──
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    flags = "_".join(k for k, v in [("vit", HCFG.use_vit), ("cnn", HCFG.use_cnn), ("moe", HCFG.use_moe)] if v)
+    run = f"{timestamp}_seed{args.seed}_{flags}"
+    run_dir = os.path.join(HCFG.results_dir, args.dataset, run)
     os.makedirs(run_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
 
-    # ── logger: console + <run_dir>/logs/train.log ────────────────────────
-    log_path = os.path.join(log_dir, "train.log")
-    log_f = open(log_path, "a", encoding="utf-8")
+    # ── logger: console + {run_dir}/run.log ───────────────────────────────
+    log_path = os.path.join(run_dir, "run.log")
+    log_f = open(log_path, "w", encoding="utf-8")
     def log(msg=""):
         print(msg)
         log_f.write(str(msg) + "\n"); log_f.flush()
@@ -199,7 +197,7 @@ def main():
 
     # ── config snapshot tied to this run ──────────────────────────────────
     cfg_snapshot = dataclasses.asdict(HCFG)
-    cfg_snapshot.update({"run": run, "dataset": args.dataset, "seed": args.seed,
+    cfg_snapshot.update({"run": run, "run_dir": run_dir, "dataset": args.dataset, "seed": args.seed,
                          "epochs": args.epochs, "frozen_epochs": args.frozen_epochs,
                          "finetune_blocks": args.finetune_blocks,
                          "finetune_cnn_stages": args.finetune_cnn_stages,
@@ -214,7 +212,7 @@ def main():
                          **({"n_gallery_imgs": len(loaders['gallery'].dataset)}
                             if 'gallery' in loaders else {}),
                          "timestamp": datetime.datetime.now().isoformat()})
-    cfg_path = os.path.join(log_dir, "config.json")
+    cfg_path = os.path.join(run_dir, "config.json")
     with open(cfg_path, "w") as f:
         json.dump(cfg_snapshot, f, indent=2)
     log(f"Config snapshot -> {cfg_path}")
@@ -316,7 +314,7 @@ def main():
 
             if r1 > best:
                 best = r1
-                ckpt = os.path.join(ckpt_dir, "best.pt")
+                ckpt = os.path.join(run_dir, "best.pt")
                 torch.save({"model": model.state_dict(), "epoch": epoch, "R@1": best,
                             "config": cfg_snapshot}, ckpt)
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
