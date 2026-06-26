@@ -12,7 +12,7 @@ from typing import List, Dict
 @dataclass
 class HyMSConfig:
     # ── Backbones ─────────────────────────────────────────────────────────
-    vit_name:    str = "facebook/dinov2-base"      # HF DINOv2 ViT-B/14, 768-d
+    vit_name:    str = "facebook/dinov2-large"      # HF DINOv2 ViT-B/14, 768-d
     cnn_name:    str = "convnext_base"             # torchvision CNN
     image_size:  int = 224
 
@@ -49,7 +49,7 @@ class HyMSConfig:
     # CLS skip = "sàn" data-efficient (≈ baseline). gate khởi tạo 0 => lúc bắt
     # đầu z ≈ CLS baseline; nhánh MoE chỉ được học tới mức nó thực sự giúp.
     use_cls_skip:    bool  = True   # đường CLS -> embedding trực tiếp (floor)
-    local_gate_init: float = 0.0    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
+    local_gate_init: float = 0.5    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
     bnneck:          bool  = True   # BatchNorm1d trước L2 (False -> LayerNorm như cũ)
 
     # ── Loss ──────────────────────────────────────────────────────────────
@@ -71,10 +71,10 @@ class HyMSConfig:
 
     # ── Training ──────────────────────────────────────────────────────────
     batch_size:    int   = 128     # class-balanced sampler (see data loader)
-    epochs:        int   = 60
+    epochs:        int   = 10
     frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
-    finetune_cnn_stages: int = 0   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
+    finetune_cnn_stages: int = 2   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
     weight_decay:  float = 1e-4
