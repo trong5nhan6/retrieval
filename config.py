@@ -63,11 +63,36 @@ class HyMSConfig:
     route_temperature: float = 0.1    # SupCon tau for rho
     lambda_route:      float = 0.5    # weight of routing-consistency loss
 
+    # ── Proxy-Anchor (chạy SONG SONG với loss chính trên z) ───────────────
+    # Khi bật, tổng loss = embed_loss(z) + lambda_proxy * ProxyAnchor(z)
+    #                      + lambda_route * route(rho).
+    # ProxyAnchor giữ một proxy học được cho MỖI lớp train (num_classes proxy),
+    # nên các proxy được đưa vào optimizer với LR riêng (proxy_lr, thường lớn
+    # hơn head_lr nhiều — theo paper gốc). Lớp test không cần proxy (zero-shot).
+    use_proxy_anchor: bool  = False   # bật để cộng Proxy-Anchor vào loss
+    lambda_proxy:     float = 1.0     # trọng số Proxy-Anchor trong tổng loss
+    pa_margin:        float = 0.1     # δ (margin) của Proxy-Anchor
+    pa_alpha:         float = 32.0    # α (scale/sharpening) của Proxy-Anchor
+    proxy_lr:         float = 1e-2    # LR riêng cho các proxy (≫ head_lr)
+
     # ── RouteRank (inference) ─────────────────────────────────────────────
+    # Defaults tuned for DENSE small-class sets (CUB/Cars: ~30–60 imgs/class).
     rr_beta:    float = 0.3      # weight of routing channel in fused score
     rr_topk:    int   = 10       # neighbours for test-time re-routing
     rr_alpha:   float = 3.0      # sharpening exponent
     rr_reroute: bool  = True
+    # Per-dataset RouteRank overrides. SOP/In-Shop are SPARSE many-class sets
+    # (~5 imgs/class): a large rr_topk drags negatives into query-expansion and
+    # the coarse 16-slot rho channel (rr_beta) is mostly noise, so both are
+    # reduced here. Empty dict for a dataset => use the global values above.
+    rr_per_dataset: Dict[str, Dict] = field(default_factory=lambda: {
+        "sop":    {"rr_topk": 4, "rr_beta": 0.1},
+        "inshop": {"rr_topk": 4, "rr_beta": 0.1},
+    })
+
+    def rr_for(self, dataset: str) -> Dict:
+        """RouteRank field overrides for a dataset (empty => use global rr_*)."""
+        return self.rr_per_dataset.get(dataset.lower(), {})
 
     # ── Training ──────────────────────────────────────────────────────────
     batch_size:    int   = 128     # class-balanced sampler (see data loader)

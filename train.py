@@ -27,7 +27,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import pandas as pd
 from tqdm import tqdm
-from pytorch_metric_learning.losses import SupConLoss, TripletMarginLoss
+from pytorch_metric_learning.losses import (SupConLoss, TripletMarginLoss,
+                                            ProxyAnchorLoss)
 from pytorch_metric_learning.miners import TripletMarginMiner
 
 from config import HCFG
@@ -74,6 +75,13 @@ def parse_args():
     p.add_argument("--head_lr", type=float, default=HCFG.head_lr)
     p.add_argument("--backbone_lr", type=float, default=HCFG.backbone_lr)
     p.add_argument("--lambda_route", type=float, default=HCFG.lambda_route)
+    # Proxy-Anchor (song song với triplet). default=None => không ghi đè HCFG/overrides.
+    p.add_argument("--use_proxy_anchor", action="store_true", default=None,
+                   help="bật Proxy-Anchor loss chạy song song với loss chính trên z")
+    p.add_argument("--lambda_proxy", type=float, default=None,
+                   help="trọng số Proxy-Anchor (mặc định lấy từ HCFG.lambda_proxy)")
+    p.add_argument("--proxy_lr", type=float, default=None,
+                   help="LR riêng cho proxy (mặc định lấy từ HCFG.proxy_lr)")
     p.add_argument("--seed", type=int, default=HCFG.seed)
     p.add_argument("--eval_every", type=int, default=HCFG.eval_every,
                    help="run test every N epochs (default from config: HCFG.eval_every)")
@@ -87,11 +95,15 @@ def evaluate(model, loaders, dataset, device):
         torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
     use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
+    # Per-dataset RouteRank params (SOP/In-Shop use a smaller rr_topk/rr_beta).
+    # dataclasses.replace gives a copy with the overrides — HCFG itself is untouched.
+    rr_over = HCFG.rr_for(dataset)
+    cfg_eval = dataclasses.replace(HCFG, **rr_over) if rr_over else HCFG
     if dataset in ("cub", "cars", "sop"):
-        return evaluate_self(model, loaders["test"], device, HCFG,
+        return evaluate_self(model, loaders["test"], device, cfg_eval,
                              use_routerank=use_rr, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],
-                                  device, HCFG, use_routerank=use_rr, recall_k=rk)
+                                  device, cfg_eval, use_routerank=use_rr, recall_k=rk)
 
 
 def build_embed_loss(cfg):
@@ -132,6 +144,13 @@ def main():
     apply_overrides(HCFG)          # notebook overrides -> trước parse_args để default lấy giá trị mới
     args = parse_args()
     HCFG.lambda_route = args.lambda_route
+    # Proxy-Anchor: chỉ ghi đè HCFG khi flag được truyền trên CLI (default=None).
+    if args.use_proxy_anchor is not None:
+        HCFG.use_proxy_anchor = args.use_proxy_anchor
+    if args.lambda_proxy is not None:
+        HCFG.lambda_proxy = args.lambda_proxy
+    if args.proxy_lr is not None:
+        HCFG.proxy_lr = args.proxy_lr
     # Soft MoE off => no rho => no routing loss / no routerank.
     if not HCFG.use_moe:
         HCFG.lambda_route = 0.0
@@ -220,14 +239,30 @@ def main():
     embed_loss, miner = build_embed_loss(HCFG)        # SupCon or Triplet on z
     route_loss = RoutingConsistencyLoss(temperature=HCFG.route_temperature)
 
+    # ── Proxy-Anchor (song song với loss chính) ───────────────────────────
+    # Một proxy học được cho mỗi lớp train; forward(z, labels) trả về scalar.
+    # Các proxy là nn.Parameter -> phải đưa vào optimizer (LR riêng = proxy_lr).
+    proxy_loss = None
+    if HCFG.use_proxy_anchor:
+        proxy_loss = ProxyAnchorLoss(num_classes=n_train_classes,
+                                     embedding_size=HCFG.embed_dim,
+                                     margin=HCFG.pa_margin,
+                                     alpha=HCFG.pa_alpha).to(device)
+        log(f"  proxy-anchor   : ON | {n_train_classes} proxies x {HCFG.embed_dim}d "
+            f"| margin={HCFG.pa_margin} alpha={HCFG.pa_alpha} "
+            f"lambda={HCFG.lambda_proxy} proxy_lr={HCFG.proxy_lr}")
+
     def make_optim(stage):
         if stage == 1:
-            return torch.optim.AdamW(model.head_parameters(),
-                                     lr=args.head_lr, weight_decay=HCFG.weight_decay)
-        return torch.optim.AdamW([
-            {"params": model.head_parameters(), "lr": args.head_lr},
-            {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
-        ], weight_decay=HCFG.weight_decay)
+            groups = [{"params": model.head_parameters(), "lr": args.head_lr}]
+        else:
+            groups = [
+                {"params": model.head_parameters(), "lr": args.head_lr},
+                {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
+            ]
+        if proxy_loss is not None:                     # proxies với LR riêng
+            groups.append({"params": list(proxy_loss.parameters()), "lr": HCFG.proxy_lr})
+        return torch.optim.AdamW(groups, weight_decay=HCFG.weight_decay)
 
     optim = make_optim(1)
     # Stage-1 scheduler spans the frozen warmup phase; rebuilt for Stage 2 below.
@@ -253,7 +288,7 @@ def main():
 
         encoder.train() if stage == 2 else encoder.eval()
         model.train()
-        tot = tot_sc = tot_rt = 0.0
+        tot = tot_sc = tot_rt = tot_pa = 0.0
 
         for imgs, labels in tqdm(loaders["train"], desc=f"Ep{epoch:3d}[S{stage}]", leave=False):
             imgs = imgs.to(device)
@@ -263,12 +298,18 @@ def main():
                 sc = embed_loss(z, labels, miner(z, labels))
             else:
                 sc = embed_loss(z, labels)
+            loss = sc
+            # Proxy-Anchor (song song): dùng cùng z và labels của batch.
+            if proxy_loss is not None:
+                pa = proxy_loss(z, labels)
+                loss = loss + HCFG.lambda_proxy * pa
+            else:
+                pa = torch.zeros((), device=z.device)
             if rho is not None and HCFG.lambda_route > 0:
                 rt = route_loss(rho, labels)
-                loss = sc + HCFG.lambda_route * rt
+                loss = loss + HCFG.lambda_route * rt
             else:
                 rt = torch.zeros((), device=z.device)
-                loss = sc
 
             optim.zero_grad()
             loss.backward()
@@ -276,7 +317,7 @@ def main():
                 model.head_parameters() + encoder.trainable_backbone_parameters(),
                 HCFG.grad_clip)
             optim.step()
-            tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
+            tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item(); tot_pa += pa.item()
 
         n = len(loaders["train"])
         # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
@@ -285,13 +326,15 @@ def main():
         # ── TRAIN log every epoch ─────────────────────────────────────────
         train_row = {"epoch": epoch, "stage": stage,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
+                     "proxy": round(tot_pa / n, 4),
                      "route": round(tot_rt / n, 4),
                      "gate": round(gate, 4) if gate is not None else None}
         train_log.append(train_row)
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
         gate_str = f" gate={gate:+.4f}" if gate is not None else ""
+        pa_str = f" pa={tot_pa/n:.4f}" if proxy_loss is not None else ""
         log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} "
-            f"(sc={tot_sc/n:.4f} rt={tot_rt/n:.4f}){gate_str}")
+            f"(sc={tot_sc/n:.4f}{pa_str} rt={tot_rt/n:.4f}){gate_str}")
 
         if sched is not None:
             sched.step()
