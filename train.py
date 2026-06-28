@@ -238,8 +238,12 @@ def main():
                             use_vit=HCFG.use_vit, use_cnn=HCFG.use_cnn)
     encoder.freeze_all()
     model = HyMSRoute(encoder, HCFG).to(device)
+    raw_model = model      # keep reference before DataParallel wrap
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        log(f"DataParallel: using {torch.cuda.device_count()} GPUs")
 
-    n_head = sum(p.numel() for p in model.head_parameters() if p.requires_grad)
+    n_head = sum(p.numel() for p in raw_model.head_parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -305,10 +309,10 @@ def main():
 
     def make_optim(stage):
         if stage == 1:
-            groups = [{"params": model.head_parameters(), "lr": args.head_lr}]
+            groups = [{"params": raw_model.head_parameters(), "lr": args.head_lr}]
         else:
             groups = [
-                {"params": model.head_parameters(), "lr": args.head_lr},
+                {"params": raw_model.head_parameters(), "lr": args.head_lr},
                 {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
             ]
         if loss_params:                                # proxy/center với LR riêng
@@ -364,7 +368,7 @@ def main():
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                model.head_parameters() + encoder.trainable_backbone_parameters()
+                raw_model.head_parameters() + encoder.trainable_backbone_parameters()
                 + loss_params + proxy_params,
                 HCFG.grad_clip)
             optim.step()
@@ -372,7 +376,7 @@ def main():
 
         n = len(loaders["train"])
         # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
-        gp = getattr(model, "local_gate", None)
+        gp = getattr(raw_model, "local_gate", None)
         gate = float(gp.detach().cpu()) if gp is not None else None
         # ── TRAIN log every epoch ─────────────────────────────────────────
         train_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type,
@@ -408,7 +412,7 @@ def main():
             if r1 > best:
                 best = r1
                 ckpt = os.path.join(run_dir, "best.pt")
-                torch.save({"model": model.state_dict(), "epoch": epoch, "R@1": best,
+                torch.save({"model": raw_model.state_dict(), "epoch": epoch, "R@1": best,
                             "config": cfg_snapshot}, ckpt)
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
 
