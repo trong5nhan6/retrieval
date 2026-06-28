@@ -375,7 +375,7 @@ def main():
         gp = getattr(model, "local_gate", None)
         gate = float(gp.detach().cpu()) if gp is not None else None
         # ── TRAIN log every epoch ─────────────────────────────────────────
-        train_row = {"epoch": epoch, "stage": stage,
+        train_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
                      "route": round(tot_rt / n, 4),
                      "gate": round(gate, 4) if gate is not None else None}
@@ -394,7 +394,7 @@ def main():
             res = evaluate(model, loaders, args.dataset, device)
             # Model-selection metric: routerank R@1 when available, else base R@1.
             r1 = res["routerank"]["R@1"] if "routerank" in res else res["base"]["R@1"]
-            test_row = {"epoch": epoch, "stage": stage}
+            test_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type}
             for tag in ("base", "routerank"):
                 if tag in res:
                     for m, v in res[tag].items():
