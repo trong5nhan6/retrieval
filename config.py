@@ -89,7 +89,7 @@ class HyMSConfig:
     #   nsoftmax | proxynca | softtriple | proxyanchor | ccl  (≫ head_lr)
     loss_lr:    float = 1e-2
     route_temperature: float = 0.1    # SupCon tau for rho (chỉ dùng nếu lambda_route>0)
-    lambda_route:      float = 0.0    # weight routing-consistency loss (0 = TẮT, representation-first)
+    lambda_route:      float = 0.1    # weight routing-consistency loss (0 = TẮT, representation-first)
 
     # ── Proxy-Anchor (chạy SONG SONG với loss chính trên z) ───────────────
     # Khi bật, tổng loss = embed_loss(z) + lambda_proxy * ProxyAnchor(z)
@@ -109,6 +109,9 @@ class HyMSConfig:
     rr_topk:    int   = 10       # neighbours for test-time re-routing
     rr_alpha:   float = 3.0      # sharpening exponent
     rr_reroute: bool  = True
+    # Bật/tắt RouteRank khi EVAL, độc lập với use_moe. Mặc định TẮT (chỉ đo base
+    # embedding, đúng hướng representation-first). Bật lại bằng --eval_routerank.
+    eval_routerank: bool = False
     # Per-dataset RouteRank overrides. SOP/In-Shop are SPARSE many-class sets
     # (~5 imgs/class): a large rr_topk drags negatives into query-expansion and
     # the coarse 16-slot rho channel (rr_beta) is mostly noise, so both are
@@ -126,7 +129,7 @@ class HyMSConfig:
     batch_size:    int   = 128     # class-balanced sampler (see data loader)
     epochs:        int   = 10
     frozen_epochs: int   = 2       # Stage-1 warmup (backbones frozen)
-    finetune_blocks: int = 2       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
+    finetune_blocks: int = 4       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
     finetune_cnn_stages: int = 2   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
