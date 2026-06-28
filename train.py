@@ -290,6 +290,19 @@ def main():
         n_lp = sum(p.numel() for p in loss_params)
         log(f"  loss params    : {n_lp:,} (proxy/center) | loss_lr={HCFG.loss_lr}")
 
+    # Proxy-Anchor song song (tuỳ chọn) — chạy cùng lúc với loss chính trên z.
+    proxy_loss = None
+    proxy_params = []
+    if HCFG.use_proxy_anchor:
+        proxy_loss = ProxyAnchorLoss(num_classes=n_train_classes,
+                                     embedding_size=HCFG.embed_dim,
+                                     margin=HCFG.pa_margin,
+                                     alpha=HCFG.pa_alpha).to(device)
+        proxy_params = list(proxy_loss.parameters())
+        log(f"  proxy-anchor   : ON | {n_train_classes} proxies x {HCFG.embed_dim}d "
+            f"| margin={HCFG.pa_margin} alpha={HCFG.pa_alpha} "
+            f"lambda={HCFG.lambda_proxy} proxy_lr={HCFG.proxy_lr}")
+
     def make_optim(stage):
         if stage == 1:
             groups = [{"params": model.head_parameters(), "lr": args.head_lr}]
@@ -300,6 +313,8 @@ def main():
             ]
         if loss_params:                                # proxy/center với LR riêng
             groups.append({"params": loss_params, "lr": HCFG.loss_lr})
+        if proxy_params:                               # proxy-anchor song song
+            groups.append({"params": proxy_params, "lr": HCFG.proxy_lr})
         return torch.optim.AdamW(groups, weight_decay=HCFG.weight_decay)
 
     optim = make_optim(1)
@@ -337,6 +352,8 @@ def main():
             else:
                 sc = embed_loss(z, labels)
             loss = sc
+            if proxy_loss is not None:
+                loss = loss + HCFG.lambda_proxy * proxy_loss(z, labels)
             # Loss phụ routing-consistency (chỉ khi lambda_route>0; mặc định 0).
             if rho is not None and HCFG.lambda_route > 0:
                 rt = route_loss(rho, labels)
@@ -347,7 +364,8 @@ def main():
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                model.head_parameters() + encoder.trainable_backbone_parameters(),
+                model.head_parameters() + encoder.trainable_backbone_parameters()
+                + loss_params + proxy_params,
                 HCFG.grad_clip)
             optim.step()
             tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
