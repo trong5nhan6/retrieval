@@ -56,12 +56,40 @@ class HyMSConfig:
     # Main embedding loss on z: "supcon" (Supervised Contrastive) or "triplet"
     # (TripletMarginLoss, optionally with semihard mining) to match baselines
     # that report "triploss". The routing loss on rho stays SupCon either way.
-    loss_type:         str   = "triplet"  # "supcon" | "triplet"
+    # MỘT loss chính trên z, chọn bằng loss_type:
+    #   triplet | supcon | ms | nsoftmax | proxynca | softtriple | proxyanchor | ccl
+    loss_type:         str   = "triplet"
     temperature:       float = 0.07   # SupCon tau for z
     triplet_margin:    float = 0.1    # margin for TripletMarginLoss (+ its miner)
     triplet_miner:     bool  = True   # mine semihard triplets (TripletMarginMiner)
-    route_temperature: float = 0.1    # SupCon tau for rho
-    lambda_route:      float = 0.5    # weight of routing-consistency loss
+    # Multi-Similarity (pair-based) + miner
+    ms_alpha:      float = 2.0
+    ms_beta:       float = 50.0
+    ms_base:       float = 0.5
+    ms_miner_eps:  float = 0.1
+    # Normalized Softmax (classification proxy)
+    nsoftmax_temp: float = 0.05
+    # ProxyNCA++
+    proxynca_scale: float = 3.0
+    # SoftTriple (đa-center/lớp)
+    softtriple_centers: int   = 2
+    softtriple_la:      float = 20.0
+    softtriple_gamma:   float = 0.1
+    softtriple_margin:  float = 0.01
+    # Center Contrastive Loss (CCL, arXiv 2308.00458)
+    ccl_temp:   float = 0.1
+    ccl_margin: float = 0.0
+    # Potential Field (PFML, arXiv 2405.18560) — reimplementation
+    pf_alpha:             float = 4.0   # tốc độ decay tương tác theo distance
+    pf_delta:             float = 0.0   # bán kính phẳng trước khi decay
+    pf_lambda_rep:        float = 1.0   # trọng số trường đẩy (repulsion)
+    pf_proxies_per_class: int   = 1     # số proxy/lớp augment field (0/1 = ít)
+    pf_use_proxies:       bool  = True
+    # LR riêng cho loss có THAM SỐ HỌC ĐƯỢC (proxy/center):
+    #   nsoftmax | proxynca | softtriple | proxyanchor | ccl  (≫ head_lr)
+    loss_lr:    float = 1e-2
+    route_temperature: float = 0.1    # SupCon tau for rho (chỉ dùng nếu lambda_route>0)
+    lambda_route:      float = 0.0    # weight routing-consistency loss (0 = TẮT, representation-first)
 
     # ── Proxy-Anchor (chạy SONG SONG với loss chính trên z) ───────────────
     # Khi bật, tổng loss = embed_loss(z) + lambda_proxy * ProxyAnchor(z)

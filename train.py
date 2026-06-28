@@ -28,8 +28,13 @@ import torch
 import pandas as pd
 from tqdm import tqdm
 from pytorch_metric_learning.losses import (SupConLoss, TripletMarginLoss,
-                                            ProxyAnchorLoss)
-from pytorch_metric_learning.miners import TripletMarginMiner
+                                            ProxyAnchorLoss, MultiSimilarityLoss,
+                                            NormalizedSoftmaxLoss, ProxyNCALoss,
+                                            SoftTripleLoss)
+from pytorch_metric_learning.miners import (TripletMarginMiner,
+                                            MultiSimilarityMiner)
+from losses.center_contrastive import CenterContrastiveLoss
+from losses.potential_field import PotentialFieldLoss
 
 from config import HCFG
 from utils import set_seed
@@ -75,6 +80,13 @@ def parse_args():
     p.add_argument("--head_lr", type=float, default=HCFG.head_lr)
     p.add_argument("--backbone_lr", type=float, default=HCFG.backbone_lr)
     p.add_argument("--lambda_route", type=float, default=HCFG.lambda_route)
+    # Loss chính: default=None => không ghi đè HCFG/overrides.
+    p.add_argument("--loss_type", type=str, default=None,
+                   choices=["triplet", "supcon", "ms", "nsoftmax", "proxynca",
+                            "softtriple", "proxyanchor", "ccl", "pfml"],
+                   help="loss chính trên embedding z")
+    p.add_argument("--loss_lr", type=float, default=None,
+                   help="LR cho tham số loss (proxy/center); mặc định HCFG.loss_lr")
     # Proxy-Anchor (song song với triplet). default=None => không ghi đè HCFG/overrides.
     p.add_argument("--use_proxy_anchor", action="store_true", default=None,
                    help="bật Proxy-Anchor loss chạy song song với loss chính trên z")
@@ -106,20 +118,51 @@ def evaluate(model, loaders, dataset, device):
                                   device, cfg_eval, use_routerank=use_rr, recall_k=rk)
 
 
-def build_embed_loss(cfg):
-    """Main loss on the retrieval embedding z.
+def build_embed_loss(cfg, num_classes, embed_dim, device):
+    """Main loss on the retrieval embedding z. Returns (loss_fn, miner).
 
-    Returns (loss_fn, miner). For "triplet" we optionally mine semihard triplets;
-    both losses share the (embeddings, labels, indices_tuple) call signature."""
-    if cfg.loss_type == "triplet":
-        loss = TripletMarginLoss(margin=cfg.triplet_margin)
+    One main loss, selected by cfg.loss_type. Some losses keep LEARNABLE params
+    (proxies/centers) — nsoftmax, proxynca, softtriple, proxyanchor, ccl — and
+    are moved to `device`; their params are added to the optimizer at cfg.loss_lr
+    (see make_optim). All losses share the (embeddings, labels, indices_tuple)
+    call signature so the training loop is loss-agnostic."""
+    t = cfg.loss_type
+    if t == "triplet":
         miner = (TripletMarginMiner(margin=cfg.triplet_margin,
                                     type_of_triplets="semihard")
                  if cfg.triplet_miner else None)
-        return loss, miner
-    if cfg.loss_type == "supcon":
+        return TripletMarginLoss(margin=cfg.triplet_margin), miner
+    if t == "supcon":
         return SupConLoss(temperature=cfg.temperature), None
-    raise ValueError(f"unknown loss_type: {cfg.loss_type!r} (use 'supcon' | 'triplet')")
+    if t == "ms":
+        loss = MultiSimilarityLoss(alpha=cfg.ms_alpha, beta=cfg.ms_beta, base=cfg.ms_base)
+        return loss, MultiSimilarityMiner(epsilon=cfg.ms_miner_eps)
+    if t == "nsoftmax":
+        return NormalizedSoftmaxLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                     temperature=cfg.nsoftmax_temp).to(device), None
+    if t == "proxynca":
+        return ProxyNCALoss(num_classes=num_classes, embedding_size=embed_dim,
+                            softmax_scale=cfg.proxynca_scale).to(device), None
+    if t == "softtriple":
+        return SoftTripleLoss(num_classes=num_classes, embedding_size=embed_dim,
+                              centers_per_class=cfg.softtriple_centers, la=cfg.softtriple_la,
+                              gamma=cfg.softtriple_gamma, margin=cfg.softtriple_margin
+                              ).to(device), None
+    if t == "proxyanchor":
+        return ProxyAnchorLoss(num_classes=num_classes, embedding_size=embed_dim,
+                               margin=cfg.pa_margin, alpha=cfg.pa_alpha).to(device), None
+    if t == "ccl":
+        return CenterContrastiveLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                     temperature=cfg.ccl_temp, margin=cfg.ccl_margin
+                                     ).to(device), None
+    if t == "pfml":
+        return PotentialFieldLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                  proxies_per_class=cfg.pf_proxies_per_class,
+                                  alpha=cfg.pf_alpha, delta=cfg.pf_delta,
+                                  lambda_rep=cfg.pf_lambda_rep,
+                                  use_proxies=cfg.pf_use_proxies).to(device), None
+    raise ValueError(f"unknown loss_type: {t!r} "
+                     "(triplet|supcon|ms|nsoftmax|proxynca|softtriple|proxyanchor|ccl|pfml)")
 
 
 def make_scheduler(optimizer, n_epochs, warmup_epochs, kind):
@@ -144,7 +187,11 @@ def main():
     apply_overrides(HCFG)          # notebook overrides -> trước parse_args để default lấy giá trị mới
     args = parse_args()
     HCFG.lambda_route = args.lambda_route
-    # Proxy-Anchor: chỉ ghi đè HCFG khi flag được truyền trên CLI (default=None).
+    # Chỉ ghi đè HCFG khi flag được truyền trên CLI (default=None).
+    if args.loss_type is not None:
+        HCFG.loss_type = args.loss_type
+    if args.loss_lr is not None:
+        HCFG.loss_lr = args.loss_lr
     if args.use_proxy_anchor is not None:
         HCFG.use_proxy_anchor = args.use_proxy_anchor
     if args.lambda_proxy is not None:
@@ -209,9 +256,7 @@ def main():
     log(f"  fusion         : cls_skip={HCFG.use_cls_skip} gate_init={HCFG.local_gate_init} bnneck={HCFG.bnneck}")
     log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
     log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
-    loss_desc = (f"triplet(margin={HCFG.triplet_margin}, miner={HCFG.triplet_miner})"
-                 if HCFG.loss_type == "triplet" else f"supcon(tau={HCFG.temperature})")
-    log(f"  embed loss     : {loss_desc}")
+    log(f"  embed loss     : {HCFG.loss_type} | lambda_route {HCFG.lambda_route}")
     log("------------------------")
 
     # ── config snapshot tied to this run ──────────────────────────────────
@@ -236,21 +281,14 @@ def main():
         json.dump(cfg_snapshot, f, indent=2)
     log(f"Config snapshot -> {cfg_path}")
 
-    embed_loss, miner = build_embed_loss(HCFG)        # SupCon or Triplet on z
+    # MỘT loss chính trên z (chọn bằng HCFG.loss_type). Một số loss giữ tham số
+    # học được (proxy/center) -> sẽ được đưa vào optimizer ở make_optim.
+    embed_loss, miner = build_embed_loss(HCFG, n_train_classes, HCFG.embed_dim, device)
     route_loss = RoutingConsistencyLoss(temperature=HCFG.route_temperature)
-
-    # ── Proxy-Anchor (song song với loss chính) ───────────────────────────
-    # Một proxy học được cho mỗi lớp train; forward(z, labels) trả về scalar.
-    # Các proxy là nn.Parameter -> phải đưa vào optimizer (LR riêng = proxy_lr).
-    proxy_loss = None
-    if HCFG.use_proxy_anchor:
-        proxy_loss = ProxyAnchorLoss(num_classes=n_train_classes,
-                                     embedding_size=HCFG.embed_dim,
-                                     margin=HCFG.pa_margin,
-                                     alpha=HCFG.pa_alpha).to(device)
-        log(f"  proxy-anchor   : ON | {n_train_classes} proxies x {HCFG.embed_dim}d "
-            f"| margin={HCFG.pa_margin} alpha={HCFG.pa_alpha} "
-            f"lambda={HCFG.lambda_proxy} proxy_lr={HCFG.proxy_lr}")
+    loss_params = list(embed_loss.parameters())        # rỗng với triplet/ms/supcon
+    if loss_params:
+        n_lp = sum(p.numel() for p in loss_params)
+        log(f"  loss params    : {n_lp:,} (proxy/center) | loss_lr={HCFG.loss_lr}")
 
     def make_optim(stage):
         if stage == 1:
@@ -260,8 +298,8 @@ def main():
                 {"params": model.head_parameters(), "lr": args.head_lr},
                 {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
             ]
-        if proxy_loss is not None:                     # proxies với LR riêng
-            groups.append({"params": list(proxy_loss.parameters()), "lr": HCFG.proxy_lr})
+        if loss_params:                                # proxy/center với LR riêng
+            groups.append({"params": loss_params, "lr": HCFG.loss_lr})
         return torch.optim.AdamW(groups, weight_decay=HCFG.weight_decay)
 
     optim = make_optim(1)
@@ -288,7 +326,7 @@ def main():
 
         encoder.train() if stage == 2 else encoder.eval()
         model.train()
-        tot = tot_sc = tot_rt = tot_pa = 0.0
+        tot = tot_sc = tot_rt = 0.0
 
         for imgs, labels in tqdm(loaders["train"], desc=f"Ep{epoch:3d}[S{stage}]", leave=False):
             imgs = imgs.to(device)
@@ -299,12 +337,7 @@ def main():
             else:
                 sc = embed_loss(z, labels)
             loss = sc
-            # Proxy-Anchor (song song): dùng cùng z và labels của batch.
-            if proxy_loss is not None:
-                pa = proxy_loss(z, labels)
-                loss = loss + HCFG.lambda_proxy * pa
-            else:
-                pa = torch.zeros((), device=z.device)
+            # Loss phụ routing-consistency (chỉ khi lambda_route>0; mặc định 0).
             if rho is not None and HCFG.lambda_route > 0:
                 rt = route_loss(rho, labels)
                 loss = loss + HCFG.lambda_route * rt
@@ -317,7 +350,7 @@ def main():
                 model.head_parameters() + encoder.trainable_backbone_parameters(),
                 HCFG.grad_clip)
             optim.step()
-            tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item(); tot_pa += pa.item()
+            tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
 
         n = len(loaders["train"])
         # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
@@ -326,15 +359,14 @@ def main():
         # ── TRAIN log every epoch ─────────────────────────────────────────
         train_row = {"epoch": epoch, "stage": stage,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
-                     "proxy": round(tot_pa / n, 4),
                      "route": round(tot_rt / n, 4),
                      "gate": round(gate, 4) if gate is not None else None}
         train_log.append(train_row)
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
         gate_str = f" gate={gate:+.4f}" if gate is not None else ""
-        pa_str = f" pa={tot_pa/n:.4f}" if proxy_loss is not None else ""
+        rt_str = f" rt={tot_rt/n:.4f}" if HCFG.lambda_route > 0 else ""
         log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} "
-            f"(sc={tot_sc/n:.4f}{pa_str} rt={tot_rt/n:.4f}){gate_str}")
+            f"(sc={tot_sc/n:.4f}{rt_str}){gate_str}")
 
         if sched is not None:
             sched.step()
