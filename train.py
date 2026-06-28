@@ -99,6 +99,8 @@ def parse_args():
                    help="run test every N epochs (default from config: HCFG.eval_every)")
     p.add_argument("--run_id", type=str, default="",
                    help="custom run identifier (default: timestamp YYYYMMDD_HHMMSS)")
+    p.add_argument("--eval_routerank", action="store_true", default=None,
+                   help="bật RouteRank khi eval (mặc định TẮT)")
     return p.parse_args()
 
 
@@ -106,7 +108,7 @@ def evaluate(model, loaders, dataset, device):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
-    use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
+    use_rr = HCFG.use_moe and HCFG.eval_routerank   # cần MoE (rho) + bật eval_routerank
     # Per-dataset RouteRank params (SOP/In-Shop use a smaller rr_topk/rr_beta).
     # dataclasses.replace gives a copy with the overrides — HCFG itself is untouched.
     rr_over = HCFG.rr_for(dataset)
@@ -192,6 +194,8 @@ def main():
         HCFG.loss_type = args.loss_type
     if args.loss_lr is not None:
         HCFG.loss_lr = args.loss_lr
+    if args.eval_routerank is not None:
+        HCFG.eval_routerank = args.eval_routerank
     if args.use_proxy_anchor is not None:
         HCFG.use_proxy_anchor = args.use_proxy_anchor
     if args.lambda_proxy is not None:
