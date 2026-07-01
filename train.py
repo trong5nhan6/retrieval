@@ -13,9 +13,12 @@ Usage:
   python train_dml.py --dataset cars  --epochs 80 --seed 0
   python train_dml.py --dataset inshop --finetune_blocks 0
 
-Outputs:
-  results/checkpoints/best_hyms_{dataset}_seed{seed}.pt
-  results/history_hyms_{dataset}_seed{seed}.csv
+Outputs (per run):
+  results/{dataset}/{timestamp}_seed{N}_{flags}/best.pt
+  results/{dataset}/{timestamp}_seed{N}_{flags}/train.csv
+  results/{dataset}/{timestamp}_seed{N}_{flags}/test.csv
+  results/{dataset}/{timestamp}_seed{N}_{flags}/config.json
+  results/{dataset}/{timestamp}_seed{N}_{flags}/run.log
 """
 import os, argparse, json, dataclasses, datetime, math
 # Reduce CUDA fragmentation (must be set BEFORE torch initializes CUDA).
@@ -24,8 +27,14 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import torch
 import pandas as pd
 from tqdm import tqdm
-from pytorch_metric_learning.losses import SupConLoss, TripletMarginLoss
-from pytorch_metric_learning.miners import TripletMarginMiner
+from pytorch_metric_learning.losses import (SupConLoss, TripletMarginLoss,
+                                            ProxyAnchorLoss, MultiSimilarityLoss,
+                                            NormalizedSoftmaxLoss, ProxyNCALoss,
+                                            SoftTripleLoss)
+from pytorch_metric_learning.miners import (TripletMarginMiner,
+                                            MultiSimilarityMiner)
+from losses.center_contrastive import CenterContrastiveLoss
+from losses.potential_field import PotentialFieldLoss
 
 from config import HCFG
 from utils import set_seed
@@ -71,11 +80,36 @@ def parse_args():
     p.add_argument("--head_lr", type=float, default=HCFG.head_lr)
     p.add_argument("--backbone_lr", type=float, default=HCFG.backbone_lr)
     p.add_argument("--lambda_route", type=float, default=HCFG.lambda_route)
+    # Loss chính: default=None => không ghi đè HCFG/overrides.
+    p.add_argument("--loss_type", type=str, default=None,
+                   choices=["triplet", "supcon", "ms", "nsoftmax", "proxynca",
+                            "softtriple", "proxyanchor", "ccl", "pfml"],
+                   help="loss chính trên embedding z")
+    p.add_argument("--loss_lr", type=float, default=None,
+                   help="LR cho tham số loss (proxy/center); mặc định HCFG.loss_lr")
+    # Proxy-Anchor (song song với triplet). default=None => không ghi đè HCFG/overrides.
+    p.add_argument("--use_proxy_anchor", action="store_true", default=None,
+                   help="bật Proxy-Anchor loss chạy song song với loss chính trên z")
+    p.add_argument("--lambda_proxy", type=float, default=None,
+                   help="trọng số Proxy-Anchor (mặc định lấy từ HCFG.lambda_proxy)")
+    p.add_argument("--proxy_lr", type=float, default=None,
+                   help="LR riêng cho proxy (mặc định lấy từ HCFG.proxy_lr)")
+    # PFML-specific hyperparameters (only used when --loss_type pfml)
+    p.add_argument("--pf_alpha", type=float, default=None,
+                   help="PFML power-law exponent α (paper best range [3,6]; 0=no decay)")
+    p.add_argument("--pf_delta", type=float, default=None,
+                   help="PFML flat-zone radius δ (paper range [0.1,0.3])")
+    p.add_argument("--pf_lambda_rep", type=float, default=None,
+                   help="PFML repulsion weight λ_rep (default 1.0)")
+    p.add_argument("--pf_ppc", type=int, default=None,
+                   help="PFML proxies-per-class M (overrides per-dataset default)")
     p.add_argument("--seed", type=int, default=HCFG.seed)
     p.add_argument("--eval_every", type=int, default=HCFG.eval_every,
                    help="run test every N epochs (default from config: HCFG.eval_every)")
     p.add_argument("--run_id", type=str, default="",
                    help="custom run identifier (default: timestamp YYYYMMDD_HHMMSS)")
+    p.add_argument("--eval_routerank", action="store_true", default=None,
+                   help="bật RouteRank khi eval (mặc định TẮT)")
     return p.parse_args()
 
 
@@ -83,28 +117,65 @@ def evaluate(model, loaders, dataset, device):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()                # defrag before eval (avoid Stage-2 OOM)
     rk = HCFG.recall_k_for(dataset)            # CUB/Cars 1/2/4/8 · In-Shop 1/10/20/30
-    use_rr = HCFG.use_moe                       # routerank needs rho (Soft MoE on)
+    use_rr = HCFG.use_moe and HCFG.eval_routerank   # cần MoE (rho) + bật eval_routerank
+    # Per-dataset RouteRank params (SOP/In-Shop use a smaller rr_topk/rr_beta).
+    # dataclasses.replace gives a copy with the overrides — HCFG itself is untouched.
+    rr_over = HCFG.rr_for(dataset)
+    cfg_eval = dataclasses.replace(HCFG, **rr_over) if rr_over else HCFG
     if dataset in ("cub", "cars", "sop"):
-        return evaluate_self(model, loaders["test"], device, HCFG,
+        return evaluate_self(model, loaders["test"], device, cfg_eval,
                              use_routerank=use_rr, recall_k=rk)
     return evaluate_query_gallery(model, loaders["query"], loaders["gallery"],
-                                  device, HCFG, use_routerank=use_rr, recall_k=rk)
+                                  device, cfg_eval, use_routerank=use_rr, recall_k=rk)
 
 
-def build_embed_loss(cfg):
-    """Main loss on the retrieval embedding z.
+def build_embed_loss(cfg, num_classes, embed_dim, device, dataset: str = ""):
+    """Main loss on the retrieval embedding z. Returns (loss_fn, miner).
 
-    Returns (loss_fn, miner). For "triplet" we optionally mine semihard triplets;
-    both losses share the (embeddings, labels, indices_tuple) call signature."""
-    if cfg.loss_type == "triplet":
-        loss = TripletMarginLoss(margin=cfg.triplet_margin)
+    One main loss, selected by cfg.loss_type. Some losses keep LEARNABLE params
+    (proxies/centers) — nsoftmax, proxynca, softtriple, proxyanchor, ccl, pfml — and
+    are moved to `device`; their params are added to the optimizer at cfg.loss_lr
+    (see make_optim). All losses share the (embeddings, labels, indices_tuple)
+    call signature so the training loop is loss-agnostic."""
+    t = cfg.loss_type
+    if t == "triplet":
         miner = (TripletMarginMiner(margin=cfg.triplet_margin,
                                     type_of_triplets="semihard")
                  if cfg.triplet_miner else None)
-        return loss, miner
-    if cfg.loss_type == "supcon":
+        return TripletMarginLoss(margin=cfg.triplet_margin), miner
+    if t == "supcon":
         return SupConLoss(temperature=cfg.temperature), None
-    raise ValueError(f"unknown loss_type: {cfg.loss_type!r} (use 'supcon' | 'triplet')")
+    if t == "ms":
+        loss = MultiSimilarityLoss(alpha=cfg.ms_alpha, beta=cfg.ms_beta, base=cfg.ms_base)
+        return loss, MultiSimilarityMiner(epsilon=cfg.ms_miner_eps)
+    if t == "nsoftmax":
+        return NormalizedSoftmaxLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                     temperature=cfg.nsoftmax_temp).to(device), None
+    if t == "proxynca":
+        return ProxyNCALoss(num_classes=num_classes, embedding_size=embed_dim,
+                            softmax_scale=cfg.proxynca_scale).to(device), None
+    if t == "softtriple":
+        return SoftTripleLoss(num_classes=num_classes, embedding_size=embed_dim,
+                              centers_per_class=cfg.softtriple_centers, la=cfg.softtriple_la,
+                              gamma=cfg.softtriple_gamma, margin=cfg.softtriple_margin
+                              ).to(device), None
+    if t == "proxyanchor":
+        return ProxyAnchorLoss(num_classes=num_classes, embedding_size=embed_dim,
+                               margin=cfg.pa_margin, alpha=cfg.pa_alpha).to(device), None
+    if t == "ccl":
+        return CenterContrastiveLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                     temperature=cfg.ccl_temp, margin=cfg.ccl_margin
+                                     ).to(device), None
+    if t == "pfml":
+        # Per-dataset proxy count override (paper: M=15 CUB/Cars, M=2 SOP/In-Shop)
+        ppc = cfg.pf_ppc_per_dataset.get(dataset.lower(), cfg.pf_proxies_per_class)
+        return PotentialFieldLoss(num_classes=num_classes, embedding_size=embed_dim,
+                                  proxies_per_class=ppc,
+                                  alpha=cfg.pf_alpha, delta=cfg.pf_delta,
+                                  lambda_rep=cfg.pf_lambda_rep,
+                                  use_proxies=cfg.pf_use_proxies).to(device), None
+    raise ValueError(f"unknown loss_type: {t!r} "
+                     "(triplet|supcon|ms|nsoftmax|proxynca|softtriple|proxyanchor|ccl|pfml)")
 
 
 def make_scheduler(optimizer, n_epochs, warmup_epochs, kind):
@@ -129,27 +200,46 @@ def main():
     apply_overrides(HCFG)          # notebook overrides -> trước parse_args để default lấy giá trị mới
     args = parse_args()
     HCFG.lambda_route = args.lambda_route
+    # Chỉ ghi đè HCFG khi flag được truyền trên CLI (default=None).
+    if args.loss_type is not None:
+        HCFG.loss_type = args.loss_type
+    if args.loss_lr is not None:
+        HCFG.loss_lr = args.loss_lr
+    if args.eval_routerank is not None:
+        HCFG.eval_routerank = args.eval_routerank
+    if args.use_proxy_anchor is not None:
+        HCFG.use_proxy_anchor = args.use_proxy_anchor
+    if args.lambda_proxy is not None:
+        HCFG.lambda_proxy = args.lambda_proxy
+    if args.proxy_lr is not None:
+        HCFG.proxy_lr = args.proxy_lr
+    # PFML overrides (only meaningful when loss_type=pfml)
+    if args.pf_alpha is not None:
+        HCFG.pf_alpha = args.pf_alpha
+    if args.pf_delta is not None:
+        HCFG.pf_delta = args.pf_delta
+    if args.pf_lambda_rep is not None:
+        HCFG.pf_lambda_rep = args.pf_lambda_rep
+    if args.pf_ppc is not None:
+        # Override both the global default and all per-dataset values
+        HCFG.pf_proxies_per_class = args.pf_ppc
+        HCFG.pf_ppc_per_dataset = {}
     # Soft MoE off => no rho => no routing loss / no routerank.
     if not HCFG.use_moe:
         HCFG.lambda_route = 0.0
     set_seed(args.seed)
-    os.makedirs(HCFG.results_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    run_id = args.run_id if args.run_id else datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run = f"hyms_{args.dataset}_seed{args.seed}_{run_id}"
-
-    # Thư mục riêng cho lần chạy này; mỗi run không đè lên nhau.
-    run_dir  = os.path.join(HCFG.results_dir, run)
-    ckpt_dir = os.path.join(run_dir, "checkpoints")
-    log_dir  = os.path.join(run_dir, "logs")
+    # ── run directory: results/{dataset}/{timestamp}_seed{N}_{active_flags} ──
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    flags = "_".join(k for k, v in [("vit", HCFG.use_vit), ("cnn", HCFG.use_cnn), ("moe", HCFG.use_moe)] if v)
+    run = f"{timestamp}_seed{args.seed}_{flags}"
+    run_dir = os.path.join(HCFG.results_dir, args.dataset, run)
     os.makedirs(run_dir, exist_ok=True)
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
 
-    # ── logger: console + <run_dir>/logs/train.log ────────────────────────
-    log_path = os.path.join(log_dir, "train.log")
-    log_f = open(log_path, "a", encoding="utf-8")
+    # ── logger: console + {run_dir}/run.log ───────────────────────────────
+    log_path = os.path.join(run_dir, "run.log")
+    log_f = open(log_path, "w", encoding="utf-8")
     def log(msg=""):
         print(msg)
         log_f.write(str(msg) + "\n"); log_f.flush()
@@ -174,8 +264,12 @@ def main():
                             use_vit=HCFG.use_vit, use_cnn=HCFG.use_cnn)
     encoder.freeze_all()
     model = HyMSRoute(encoder, HCFG).to(device)
+    raw_model = model      # keep reference before DataParallel wrap
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+        log(f"DataParallel: using {torch.cuda.device_count()} GPUs")
 
-    n_head = sum(p.numel() for p in model.head_parameters() if p.requires_grad)
+    n_head = sum(p.numel() for p in raw_model.head_parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -192,14 +286,17 @@ def main():
     log(f"  fusion         : cls_skip={HCFG.use_cls_skip} gate_init={HCFG.local_gate_init} bnneck={HCFG.bnneck}")
     log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
     log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
-    loss_desc = (f"triplet(margin={HCFG.triplet_margin}, miner={HCFG.triplet_miner})"
-                 if HCFG.loss_type == "triplet" else f"supcon(tau={HCFG.temperature})")
-    log(f"  embed loss     : {loss_desc}")
+    log(f"  embed loss     : {HCFG.loss_type} | lambda_route {HCFG.lambda_route}")
+    if HCFG.loss_type == "pfml":
+        ppc_eff = HCFG.pf_ppc_per_dataset.get(args.dataset.lower(), HCFG.pf_proxies_per_class)
+        log(f"  pfml           : α={HCFG.pf_alpha} δ={HCFG.pf_delta} "
+            f"λ_rep={HCFG.pf_lambda_rep} M={ppc_eff} proxies/class "
+            f"(total proxies: {n_train_classes * ppc_eff:,})")
     log("------------------------")
 
     # ── config snapshot tied to this run ──────────────────────────────────
     cfg_snapshot = dataclasses.asdict(HCFG)
-    cfg_snapshot.update({"run": run, "dataset": args.dataset, "seed": args.seed,
+    cfg_snapshot.update({"run": run, "run_dir": run_dir, "dataset": args.dataset, "seed": args.seed,
                          "epochs": args.epochs, "frozen_epochs": args.frozen_epochs,
                          "finetune_blocks": args.finetune_blocks,
                          "finetune_cnn_stages": args.finetune_cnn_stages,
@@ -214,22 +311,47 @@ def main():
                          **({"n_gallery_imgs": len(loaders['gallery'].dataset)}
                             if 'gallery' in loaders else {}),
                          "timestamp": datetime.datetime.now().isoformat()})
-    cfg_path = os.path.join(log_dir, "config.json")
+    cfg_path = os.path.join(run_dir, "config.json")
     with open(cfg_path, "w") as f:
         json.dump(cfg_snapshot, f, indent=2)
     log(f"Config snapshot -> {cfg_path}")
 
-    embed_loss, miner = build_embed_loss(HCFG)        # SupCon or Triplet on z
+    # MỘT loss chính trên z (chọn bằng HCFG.loss_type). Một số loss giữ tham số
+    # học được (proxy/center) -> sẽ được đưa vào optimizer ở make_optim.
+    embed_loss, miner = build_embed_loss(HCFG, n_train_classes, HCFG.embed_dim, device,
+                                         dataset=args.dataset)
     route_loss = RoutingConsistencyLoss(temperature=HCFG.route_temperature)
+    loss_params = list(embed_loss.parameters())        # rỗng với triplet/ms/supcon
+    if loss_params:
+        n_lp = sum(p.numel() for p in loss_params)
+        log(f"  loss params    : {n_lp:,} (proxy/center) | loss_lr={HCFG.loss_lr}")
+
+    # Proxy-Anchor song song (tuỳ chọn) — chạy cùng lúc với loss chính trên z.
+    proxy_loss = None
+    proxy_params = []
+    if HCFG.use_proxy_anchor:
+        proxy_loss = ProxyAnchorLoss(num_classes=n_train_classes,
+                                     embedding_size=HCFG.embed_dim,
+                                     margin=HCFG.pa_margin,
+                                     alpha=HCFG.pa_alpha).to(device)
+        proxy_params = list(proxy_loss.parameters())
+        log(f"  proxy-anchor   : ON | {n_train_classes} proxies x {HCFG.embed_dim}d "
+            f"| margin={HCFG.pa_margin} alpha={HCFG.pa_alpha} "
+            f"lambda={HCFG.lambda_proxy} proxy_lr={HCFG.proxy_lr}")
 
     def make_optim(stage):
         if stage == 1:
-            return torch.optim.AdamW(model.head_parameters(),
-                                     lr=args.head_lr, weight_decay=HCFG.weight_decay)
-        return torch.optim.AdamW([
-            {"params": model.head_parameters(), "lr": args.head_lr},
-            {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
-        ], weight_decay=HCFG.weight_decay)
+            groups = [{"params": raw_model.head_parameters(), "lr": args.head_lr}]
+        else:
+            groups = [
+                {"params": raw_model.head_parameters(), "lr": args.head_lr},
+                {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
+            ]
+        if loss_params:                                # proxy/center với LR riêng
+            groups.append({"params": loss_params, "lr": HCFG.loss_lr})
+        if proxy_params:                               # proxy-anchor song song
+            groups.append({"params": proxy_params, "lr": HCFG.proxy_lr})
+        return torch.optim.AdamW(groups, weight_decay=HCFG.weight_decay)
 
     optim = make_optim(1)
     # Stage-1 scheduler spans the frozen warmup phase; rebuilt for Stage 2 below.
@@ -265,35 +387,40 @@ def main():
                 sc = embed_loss(z, labels, miner(z, labels))
             else:
                 sc = embed_loss(z, labels)
+            loss = sc
+            if proxy_loss is not None:
+                loss = loss + HCFG.lambda_proxy * proxy_loss(z, labels)
+            # Loss phụ routing-consistency (chỉ khi lambda_route>0; mặc định 0).
             if rho is not None and HCFG.lambda_route > 0:
                 rt = route_loss(rho, labels)
-                loss = sc + HCFG.lambda_route * rt
+                loss = loss + HCFG.lambda_route * rt
             else:
                 rt = torch.zeros((), device=z.device)
-                loss = sc
 
             optim.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
-                model.head_parameters() + encoder.trainable_backbone_parameters(),
+                raw_model.head_parameters() + encoder.trainable_backbone_parameters()
+                + loss_params + proxy_params,
                 HCFG.grad_clip)
             optim.step()
             tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
 
         n = len(loaders["train"])
         # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
-        gp = getattr(model, "local_gate", None)
+        gp = getattr(raw_model, "local_gate", None)
         gate = float(gp.detach().cpu()) if gp is not None else None
         # ── TRAIN log every epoch ─────────────────────────────────────────
-        train_row = {"epoch": epoch, "stage": stage,
+        train_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
                      "route": round(tot_rt / n, 4),
                      "gate": round(gate, 4) if gate is not None else None}
         train_log.append(train_row)
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
         gate_str = f" gate={gate:+.4f}" if gate is not None else ""
+        rt_str = f" rt={tot_rt/n:.4f}" if HCFG.lambda_route > 0 else ""
         log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} "
-            f"(sc={tot_sc/n:.4f} rt={tot_rt/n:.4f}){gate_str}")
+            f"(sc={tot_sc/n:.4f}{rt_str}){gate_str}")
 
         if sched is not None:
             sched.step()
@@ -303,7 +430,7 @@ def main():
             res = evaluate(model, loaders, args.dataset, device)
             # Model-selection metric: routerank R@1 when available, else base R@1.
             r1 = res["routerank"]["R@1"] if "routerank" in res else res["base"]["R@1"]
-            test_row = {"epoch": epoch, "stage": stage}
+            test_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type}
             for tag in ("base", "routerank"):
                 if tag in res:
                     for m, v in res[tag].items():
@@ -316,8 +443,8 @@ def main():
 
             if r1 > best:
                 best = r1
-                ckpt = os.path.join(ckpt_dir, "best.pt")
-                torch.save({"model": model.state_dict(), "epoch": epoch, "R@1": best,
+                ckpt = os.path.join(run_dir, "best.pt")
+                torch.save({"model": raw_model.state_dict(), "epoch": epoch, "R@1": best,
                             "config": cfg_snapshot}, ckpt)
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
 

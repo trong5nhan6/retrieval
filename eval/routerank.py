@@ -230,10 +230,14 @@ def evaluate_self(model, loader, device, cfg, use_routerank=True, recall_k=None)
             Zg, Rg = _qe_chunked(Z, R, cfg.rr_topk, cfg.rr_alpha, _CHUNK, dev)
         else:
             Zg, Rg = Z, R
-        # r_offset=0 mirrors the full routerank path (self masked in ranking but
-        # still counted in R via _metrics_from_sim(..., exclude_self=False)).
+        # BUG FIX (self-retrieval R-count): the query's own item is masked out of
+        # ranking (mask_self=True) and can NEVER be retrieved, so it must NOT be
+        # counted in the relevant total R. r_offset=1 makes R = (#same-label − 1),
+        # matching the base path. The old r_offset=0 inflated R by 1, capping
+        # R-Precision/mAP@R at (R−1)/R — negligible on CUB/Cars (~30–60 imgs/class)
+        # but a large artificial deflation on SOP (~5 imgs/class).
         rr = _metrics_chunked(Zg, Rg, Y, Zg, Rg, Y, cfg.rr_beta, rk,
-                              mask_self=True, r_offset=0, chunk=_CHUNK, device=dev)
+                              mask_self=True, r_offset=1, chunk=_CHUNK, device=dev)
         return {"base": base, "routerank": rr}
 
     base = _metrics_from_sim(Z @ Z.T, Y, Y, rk, exclude_self=True)
@@ -241,7 +245,11 @@ def evaluate_self(model, loader, device, cfg, use_routerank=True, recall_k=None)
         return {"base": base}
     S = routerank_sim(Z, R, Z, R, cfg.rr_beta, cfg.rr_topk, cfg.rr_alpha,
                       cfg.rr_reroute, self_retrieval=True)
-    rr = _metrics_from_sim(S, Y, Y, rk, exclude_self=False)
+    # BUG FIX: exclude_self=True so the query's own item is dropped from the
+    # relevant count R (it is already ranked last via the −1e9 diagonal). This
+    # matches the base path; the old exclude_self=False over-counted R by 1,
+    # deflating R-Precision/mAP@R most on small-class datasets like SOP.
+    rr = _metrics_from_sim(S, Y, Y, rk, exclude_self=True)
     return {"base": base, "routerank": rr}
 
 

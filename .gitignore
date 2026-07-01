@@ -10,3 +10,4 @@ figures/
 *.pth
 .DS_Store
 paper write/
+paper read/
