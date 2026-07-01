@@ -94,6 +94,15 @@ def parse_args():
                    help="trọng số Proxy-Anchor (mặc định lấy từ HCFG.lambda_proxy)")
     p.add_argument("--proxy_lr", type=float, default=None,
                    help="LR riêng cho proxy (mặc định lấy từ HCFG.proxy_lr)")
+    # PFML-specific hyperparameters (only used when --loss_type pfml)
+    p.add_argument("--pf_alpha", type=float, default=None,
+                   help="PFML power-law exponent α (paper best range [3,6]; 0=no decay)")
+    p.add_argument("--pf_delta", type=float, default=None,
+                   help="PFML flat-zone radius δ (paper range [0.1,0.3])")
+    p.add_argument("--pf_lambda_rep", type=float, default=None,
+                   help="PFML repulsion weight λ_rep (default 1.0)")
+    p.add_argument("--pf_ppc", type=int, default=None,
+                   help="PFML proxies-per-class M (overrides per-dataset default)")
     p.add_argument("--seed", type=int, default=HCFG.seed)
     p.add_argument("--eval_every", type=int, default=HCFG.eval_every,
                    help="run test every N epochs (default from config: HCFG.eval_every)")
@@ -120,11 +129,11 @@ def evaluate(model, loaders, dataset, device):
                                   device, cfg_eval, use_routerank=use_rr, recall_k=rk)
 
 
-def build_embed_loss(cfg, num_classes, embed_dim, device):
+def build_embed_loss(cfg, num_classes, embed_dim, device, dataset: str = ""):
     """Main loss on the retrieval embedding z. Returns (loss_fn, miner).
 
     One main loss, selected by cfg.loss_type. Some losses keep LEARNABLE params
-    (proxies/centers) — nsoftmax, proxynca, softtriple, proxyanchor, ccl — and
+    (proxies/centers) — nsoftmax, proxynca, softtriple, proxyanchor, ccl, pfml — and
     are moved to `device`; their params are added to the optimizer at cfg.loss_lr
     (see make_optim). All losses share the (embeddings, labels, indices_tuple)
     call signature so the training loop is loss-agnostic."""
@@ -158,8 +167,10 @@ def build_embed_loss(cfg, num_classes, embed_dim, device):
                                      temperature=cfg.ccl_temp, margin=cfg.ccl_margin
                                      ).to(device), None
     if t == "pfml":
+        # Per-dataset proxy count override (paper: M=15 CUB/Cars, M=2 SOP/In-Shop)
+        ppc = cfg.pf_ppc_per_dataset.get(dataset.lower(), cfg.pf_proxies_per_class)
         return PotentialFieldLoss(num_classes=num_classes, embedding_size=embed_dim,
-                                  proxies_per_class=cfg.pf_proxies_per_class,
+                                  proxies_per_class=ppc,
                                   alpha=cfg.pf_alpha, delta=cfg.pf_delta,
                                   lambda_rep=cfg.pf_lambda_rep,
                                   use_proxies=cfg.pf_use_proxies).to(device), None
@@ -202,6 +213,17 @@ def main():
         HCFG.lambda_proxy = args.lambda_proxy
     if args.proxy_lr is not None:
         HCFG.proxy_lr = args.proxy_lr
+    # PFML overrides (only meaningful when loss_type=pfml)
+    if args.pf_alpha is not None:
+        HCFG.pf_alpha = args.pf_alpha
+    if args.pf_delta is not None:
+        HCFG.pf_delta = args.pf_delta
+    if args.pf_lambda_rep is not None:
+        HCFG.pf_lambda_rep = args.pf_lambda_rep
+    if args.pf_ppc is not None:
+        # Override both the global default and all per-dataset values
+        HCFG.pf_proxies_per_class = args.pf_ppc
+        HCFG.pf_ppc_per_dataset = {}
     # Soft MoE off => no rho => no routing loss / no routerank.
     if not HCFG.use_moe:
         HCFG.lambda_route = 0.0
@@ -265,6 +287,11 @@ def main():
     log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
     log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
     log(f"  embed loss     : {HCFG.loss_type} | lambda_route {HCFG.lambda_route}")
+    if HCFG.loss_type == "pfml":
+        ppc_eff = HCFG.pf_ppc_per_dataset.get(args.dataset.lower(), HCFG.pf_proxies_per_class)
+        log(f"  pfml           : α={HCFG.pf_alpha} δ={HCFG.pf_delta} "
+            f"λ_rep={HCFG.pf_lambda_rep} M={ppc_eff} proxies/class "
+            f"(total proxies: {n_train_classes * ppc_eff:,})")
     log("------------------------")
 
     # ── config snapshot tied to this run ──────────────────────────────────
@@ -291,7 +318,8 @@ def main():
 
     # MỘT loss chính trên z (chọn bằng HCFG.loss_type). Một số loss giữ tham số
     # học được (proxy/center) -> sẽ được đưa vào optimizer ở make_optim.
-    embed_loss, miner = build_embed_loss(HCFG, n_train_classes, HCFG.embed_dim, device)
+    embed_loss, miner = build_embed_loss(HCFG, n_train_classes, HCFG.embed_dim, device,
+                                         dataset=args.dataset)
     route_loss = RoutingConsistencyLoss(temperature=HCFG.route_temperature)
     loss_params = list(embed_loss.parameters())        # rỗng với triplet/ms/supcon
     if loss_params:

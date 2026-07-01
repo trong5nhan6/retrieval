@@ -79,12 +79,18 @@ class HyMSConfig:
     # Center Contrastive Loss (CCL, arXiv 2308.00458)
     ccl_temp:   float = 0.1
     ccl_margin: float = 0.0
-    # Potential Field (PFML, arXiv 2405.18560) — reimplementation
-    pf_alpha:             float = 4.0   # tốc độ decay tương tác theo distance
-    pf_delta:             float = 0.0   # bán kính phẳng trước khi decay
-    pf_lambda_rep:        float = 1.0   # trọng số trường đẩy (repulsion)
-    pf_proxies_per_class: int   = 1     # số proxy/lớp augment field (0/1 = ít)
+    # Potential Field (PFML, arXiv 2405.18560) — faithful reimplementation
+    # Paper tunes: alpha∈[3,6] (best), delta∈[0.1,0.3], M=15 (CUB/Cars), M=2 (SOP)
+    pf_alpha:             float = 4.0   # power-law exponent α (0=no decay → constant field)
+    pf_delta:             float = 0.2   # flat-zone radius δ (margin-like: [0.1, 0.3])
+    pf_lambda_rep:        float = 1.0   # weight of repulsion term λ_rep
+    pf_proxies_per_class: int   = 15    # M proxies/class (M=15 CUB/Cars, M=2 SOP)
     pf_use_proxies:       bool  = True
+    # Per-dataset override for proxies_per_class (paper: SOP uses M=2, CUB/Cars M=15)
+    pf_ppc_per_dataset: Dict[str, int] = field(default_factory=lambda: {
+        "sop":    2,
+        "inshop": 2,
+    })
     # LR riêng cho loss có THAM SỐ HỌC ĐƯỢC (proxy/center):
     #   nsoftmax | proxynca | softtriple | proxyanchor | ccl  (≫ head_lr)
     loss_lr:    float = 1e-2
