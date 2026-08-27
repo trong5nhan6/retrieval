@@ -2,7 +2,7 @@ __pycache__/
 *.pyc
 *.pyo
 .ipynb_checkpoints/
-results/
+results/    
 datasets/
 docs/
 figures/
@@ -11,3 +11,4 @@ figures/
 .DS_Store
 paper write/
 paper read/
+*.md
