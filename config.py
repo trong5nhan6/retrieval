@@ -18,7 +18,7 @@ class HyMSConfig:
 
     # CNN stages to use (indices into the 4 ConvNeXt stages: 0=s1 .. 3=s4)
     # Default: all 4 stages. Ablate by e.g. [1, 2, 3] (drop the noisy s1).
-    cnn_stages:  List[int] = field(default_factory=lambda: [0, 1, 2, 3])
+    cnn_stages:  List[int] = field(default_factory=lambda: [2, 3])
 
     # ── Token assembly ────────────────────────────────────────────────────
     token_dim:        int = 768     # common token dim d (both branches projected to this)
@@ -33,16 +33,12 @@ class HyMSConfig:
     use_vit:  bool = True
     use_cnn:  bool = True
     use_moe:  bool = True
-
-    # ── Soft MoE ──────────────────────────────────────────────────────────
-    n_experts:        int = 8
-    slots_per_expert: int = 2       # total slots S = n_experts * slots_per_expert
-    expert_hidden:    int = 512
-
-    # ── Heads ─────────────────────────────────────────────────────────────
-    embed_dim:   int = 512          # retrieval embedding z (was 256 bottleneck)
-    route_dim:   int = 64           # routing descriptor rho
-    dropout:     float = 0.1
+    # Nhánh "local" = pool(token) -> local_proj. ĐO ĐƯỢC (CUB, ckpt 164207):
+    # ép local_gate=0 lúc eval cho R@1 90.19 -> 90.29 và mAP@R 62.41 -> 62.53,
+    # tức nhánh này đóng góp ÂM. Nguyên nhân: AttnPool gần uniform => tương
+    # đương patch-mean, mà patch-mean của DINOv2-L chỉ đạt 35.11 R@1 so với
+    # CLS 89.23. Mặc định TẮT; bật lại bằng --local_branch để lấy bảng ablation.
+    use_local_branch: bool = False
 
     # ── Embedding fusion (cải tiến) ───────────────────────────────────────
     # z = L2( norm( cls_proj(CLS) + gate * local_proj(pool(MoE tokens)) ) )
@@ -52,13 +48,42 @@ class HyMSConfig:
     local_gate_init: float = 0.5    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
     bnneck:          bool  = True   # BatchNorm1d trước L2 (False -> LayerNorm như cũ)
 
+    # ── Pooling token -> một vector ───────────────────────────────────────
+    # "attn": AttnPool cũ. ĐO ĐƯỢC: khối lượng attention là 0.00275/token (ViT)
+    #   và 0.00231/token (CNN) so với phân bố đều 0.0026 — nó KHÔNG chọn lọc gì,
+    #   chỉ là mean-pool trá hình (q init 0.02*randn, logits lại chia sqrt(d)).
+    # "gem": GeM với p học được. Zero-shot trên DINOv2-L: mean 35.11, GeM p=3
+    #   42.08, GeM p=5 50.47, max 68.33 -> p càng lớn càng gần max-pool.
+    pool_type:  str   = "gem"       # "gem" | "attn"
+    gem_p_init: float = 3.0
+
+    # ── Soft MoE ──────────────────────────────────────────────────────────
+    n_experts:        int = 4
+    slots_per_expert: int = 2       # total slots S = n_experts * slots_per_expert
+    expert_hidden:    int = 128
+    # NƠI ĐẶT MoE — quyết định nó có đóng góp được gì hay không.
+    #   "tokens": MoE xử lý token rồi pool vào nhánh local (hành vi cũ). Trần của
+    #     đường này là pooled-token ~68 R@1 so với CLS 89.23, và nhánh local lại
+    #     đóng góp âm => MoE đo được 90.18 vs 90.19 (chênh 0.6 ảnh trên 5924).
+    #   "cls": CLS được NỐI VÀO tập token, MoE định tuyến bằng chứng đa tỉ lệ
+    #     *vào* CLS, phần tinh chỉnh cộng residual vào embedding. gamma_moe=0
+    #     => z hệt baseline CLS. Đây là đường duy nhất đặt MoE lên nhánh 90 điểm.
+    moe_target:     str   = "cls"   # "cls" | "tokens"
+    moe_gate_init:  float = 0.1     # gamma_moe (0 => MoE là identity)
+    moe_gate_lr:    float = 1e-2    # LR riêng: scalar gate ở lr=1e-4 gần như bất động
+
+    # ── Heads ─────────────────────────────────────────────────────────────
+    embed_dim:   int = 512          # retrieval embedding z (was 256 bottleneck)
+    route_dim:   int = 64           # routing descriptor rho
+    dropout:     float = 0.1
+
     # ── Loss ──────────────────────────────────────────────────────────────
     # Main embedding loss on z: "supcon" (Supervised Contrastive) or "triplet"
     # (TripletMarginLoss, optionally with semihard mining) to match baselines
     # that report "triploss". The routing loss on rho stays SupCon either way.
     # MỘT loss chính trên z, chọn bằng loss_type:
     #   triplet | supcon | ms | nsoftmax | proxynca | softtriple | proxyanchor | ccl
-    loss_type:         str   = "triplet"
+    loss_type:         str   = "ccl"
     temperature:       float = 0.07   # SupCon tau for z
     triplet_margin:    float = 0.1    # margin for TripletMarginLoss (+ its miner)
     triplet_miner:     bool  = True   # mine semihard triplets (TripletMarginMiner)
@@ -95,7 +120,11 @@ class HyMSConfig:
     #   nsoftmax | proxynca | softtriple | proxyanchor | ccl  (≫ head_lr)
     loss_lr:    float = 1e-2
     route_temperature: float = 0.1    # SupCon tau for rho (chỉ dùng nếu lambda_route>0)
-    lambda_route:      float = 0.1    # weight routing-consistency loss (0 = TẮT, representation-first)
+    # ĐO ĐƯỢC (run 160148): tỉ trọng lambda_route*rt trong tổng loss đi từ 19%
+    # (ep1) -> 63% (ep4) -> 92% (ep14) vì sc bão hoà còn rt thì không, và R@1
+    # giảm đơn điệu 84.66 -> 83.58 đúng theo nhịp đó. Loss này tác động lên chính
+    # phi, tức lên cả đường biểu diễn. Mặc định TẮT trong giai đoạn học biểu diễn.
+    lambda_route:      float = 0.0    # weight routing-consistency loss (0 = TẮT)
 
     # ── Proxy-Anchor (chạy SONG SONG với loss chính trên z) ───────────────
     # Khi bật, tổng loss = embed_loss(z) + lambda_proxy * ProxyAnchor(z)

@@ -110,6 +110,19 @@ def parse_args():
                    help="custom run identifier (default: timestamp YYYYMMDD_HHMMSS)")
     p.add_argument("--eval_routerank", action="store_true", default=None,
                    help="bật RouteRank khi eval (mặc định TẮT)")
+    # ── ablation cho nhánh local / vị trí MoE / pooling ────────────────────
+    p.add_argument("--moe_target", type=str, default=None, choices=["cls", "tokens"],
+                   help="'cls': MoE định tuyến vào CLS (mặc định) | 'tokens': cách cũ")
+    p.add_argument("--pool_type", type=str, default=None, choices=["gem", "attn"],
+                   help="pooling token: 'gem' (mặc định) | 'attn' (AttnPool cũ)")
+    p.add_argument("--local_branch", dest="local_branch", action="store_true", default=None,
+                   help="BẬT nhánh pooled-token (mặc định TẮT: đo được đóng góp âm)")
+    p.add_argument("--no_local_branch", dest="local_branch", action="store_false",
+                   help="TẮT nhánh pooled-token")
+    p.add_argument("--moe_gate_init", type=float, default=None,
+                   help="gamma_moe khởi tạo (0 => MoE là identity)")
+    p.add_argument("--no_moe", dest="use_moe", action="store_false", default=None,
+                   help="tắt Soft MoE")
     return p.parse_args()
 
 
@@ -207,6 +220,16 @@ def main():
         HCFG.loss_lr = args.loss_lr
     if args.eval_routerank is not None:
         HCFG.eval_routerank = args.eval_routerank
+    if args.moe_target is not None:
+        HCFG.moe_target = args.moe_target
+    if args.pool_type is not None:
+        HCFG.pool_type = args.pool_type
+    if args.local_branch is not None:
+        HCFG.use_local_branch = args.local_branch
+    if args.moe_gate_init is not None:
+        HCFG.moe_gate_init = args.moe_gate_init
+    if args.use_moe is not None:
+        HCFG.use_moe = args.use_moe
     if args.use_proxy_anchor is not None:
         HCFG.use_proxy_anchor = args.use_proxy_anchor
     if args.lambda_proxy is not None:
@@ -283,7 +306,11 @@ def main():
         f"(classes_per_batch {HCFG.classes_per_batch} x samples_per_class {HCFG.samples_per_class})")
     log(f"  n_experts      : {HCFG.n_experts} | slots_per_expert {HCFG.slots_per_expert} | num_slots {HCFG.num_slots}")
     log(f"  embed_dim      : {HCFG.embed_dim} | route_dim {HCFG.route_dim} | lambda_route {HCFG.lambda_route}")
-    log(f"  fusion         : cls_skip={HCFG.use_cls_skip} gate_init={HCFG.local_gate_init} bnneck={HCFG.bnneck}")
+    log(f"  fusion         : cls_skip={HCFG.use_cls_skip} local_branch={raw_model.use_local_branch} "
+        f"gate_init={HCFG.local_gate_init} bnneck={HCFG.bnneck}")
+    log(f"  pooling        : {HCFG.pool_type}" + (f" (p_init={HCFG.gem_p_init})" if HCFG.pool_type == "gem" else ""))
+    log(f"  moe            : target={raw_model.moe_target} gamma_init={HCFG.moe_gate_init} "
+        f"gate_lr={HCFG.moe_gate_lr}")
     log(f"  switches       : use_vit={HCFG.use_vit} use_cnn={HCFG.use_cnn} use_moe={HCFG.use_moe}")
     log(f"  lr_schedule    : {HCFG.lr_schedule} (warmup {HCFG.warmup_epochs})")
     log(f"  embed loss     : {HCFG.loss_type} | lambda_route {HCFG.lambda_route}")
@@ -339,6 +366,12 @@ def main():
             f"| margin={HCFG.pa_margin} alpha={HCFG.pa_alpha} "
             f"lambda={HCFG.lambda_proxy} proxy_lr={HCFG.proxy_lr}")
 
+    # Scalar gate (gamma_moe, GeM p, local_gate) đi nhóm riêng: ở head_lr=1e-4
+    # chúng gần như bất động (đo trên local_gate: 0.5003 -> 0.5214 sau 10 epoch).
+    gate_params = raw_model.gate_parameters()
+    if gate_params:
+        log(f"  gate params    : {len(gate_params)} scalar | moe_gate_lr={HCFG.moe_gate_lr} | weight_decay=0")
+
     def make_optim(stage):
         if stage == 1:
             groups = [{"params": raw_model.head_parameters(), "lr": args.head_lr}]
@@ -347,6 +380,9 @@ def main():
                 {"params": raw_model.head_parameters(), "lr": args.head_lr},
                 {"params": encoder.trainable_backbone_parameters(), "lr": args.backbone_lr},
             ]
+        if gate_params:                                # gamma_moe / GeM p / local_gate
+            groups.append({"params": gate_params, "lr": HCFG.moe_gate_lr,
+                           "weight_decay": 0.0})
         if loss_params:                                # proxy/center với LR riêng
             groups.append({"params": loss_params, "lr": HCFG.loss_lr})
         if proxy_params:                               # proxy-anchor song song
@@ -401,23 +437,33 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 raw_model.head_parameters() + encoder.trainable_backbone_parameters()
-                + loss_params + proxy_params,
+                + gate_params + loss_params + proxy_params,
                 HCFG.grad_clip)
             optim.step()
             tot += loss.item(); tot_sc += sc.item(); tot_rt += rt.item()
 
         n = len(loaders["train"])
-        # γ = local_gate (sức nặng nhánh MoE). None nếu tắt cls_skip.
+        # Theo dõi TỪNG gate: gamma_moe (sức nặng khối MoE), p của GeM, local_gate.
+        # gamma_moe ≈ 0 ở cuối train => MoE không đóng góp; đây là phép đo trực
+        # tiếp cho câu hỏi "MoE có ích không", không cần chạy ablation riêng.
+        gates = {}
+        if raw_model.softmoe is not None:
+            gates["γmoe"] = float(raw_model.softmoe.gamma.detach().cpu())
+        if raw_model.pool is not None and hasattr(raw_model.pool, "p"):
+            gates["gem_p"] = float(raw_model.pool.p.detach().cpu())
         gp = getattr(raw_model, "local_gate", None)
-        gate = float(gp.detach().cpu()) if gp is not None else None
+        if gp is not None:
+            gates["γlocal"] = float(gp.detach().cpu())
+        gate = gates.get("γlocal")
         # ── TRAIN log every epoch ─────────────────────────────────────────
         train_row = {"epoch": epoch, "stage": stage, "loss_type": HCFG.loss_type,
                      "loss": round(tot / n, 4), "sc": round(tot_sc / n, 4),
                      "route": round(tot_rt / n, 4),
-                     "gate": round(gate, 4) if gate is not None else None}
+                     "gate": round(gate, 4) if gate is not None else None,
+                     **{k: round(v, 4) for k, v in gates.items()}}
         train_log.append(train_row)
         pd.DataFrame(train_log).to_csv(train_csv, index=False)   # incremental
-        gate_str = f" gate={gate:+.4f}" if gate is not None else ""
+        gate_str = "".join(f" {k}={v:+.4f}" for k, v in gates.items())
         rt_str = f" rt={tot_rt/n:.4f}" if HCFG.lambda_route > 0 else ""
         log(f"Ep{epoch:3d}[S{stage}] train loss={tot/n:.4f} "
             f"(sc={tot_sc/n:.4f}{rt_str}){gate_str}")
@@ -449,10 +495,16 @@ def main():
                 log(f"   -> new best R@1={best:.2f}  saved {ckpt}")
 
     log(f"Done. Best R@1={best:.2f}")
-    gp = getattr(model, "local_gate", None)
+    if raw_model.softmoe is not None:
+        gm = float(raw_model.softmoe.gamma.detach().cpu())
+        log(f"Final γ_moe = {gm:+.4f} (init {HCFG.moe_gate_init})  "
+            f"— |γ| co lại về ~0 nghĩa là MoE không đóng góp; lớn lên nghĩa là có ích")
+    if raw_model.pool is not None and hasattr(raw_model.pool, "p"):
+        log(f"Final GeM p = {float(raw_model.pool.p.detach().cpu()):.3f} "
+            f"(init {HCFG.gem_p_init}; p→1 là mean, p lớn là max)")
+    gp = getattr(raw_model, "local_gate", None)
     if gp is not None:
-        log(f"Final local_gate γ = {float(gp.detach().cpu()):+.4f}  "
-            f"(γ≈0 -> MoE branch không đóng góp; |γ| lớn -> MoE có ích)")
+        log(f"Final local_gate γ = {float(gp.detach().cpu()):+.4f}")
 
     # ── auto-plot test metrics + train loss -> results/plot_*_{run}.png ────
     try:
