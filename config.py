@@ -32,7 +32,7 @@ class HyMSConfig:
     # disables rho/routerank/route-loss automatically (see train/eval).
     use_vit:  bool = True
     use_cnn:  bool = True
-    use_moe:  bool = True
+    use_moe:  bool = False
     # Nhánh "local" = pool(token) -> local_proj. ĐO ĐƯỢC (CUB, ckpt 164207):
     # ép local_gate=0 lúc eval cho R@1 90.19 -> 90.29 và mAP@R 62.41 -> 62.53,
     # tức nhánh này đóng góp ÂM. Nguyên nhân: AttnPool gần uniform => tương
@@ -44,7 +44,7 @@ class HyMSConfig:
     # z = L2( norm( cls_proj(CLS) + gate * local_proj(pool(MoE tokens)) ) )
     # CLS skip = "sàn" data-efficient (≈ baseline). gate khởi tạo 0 => lúc bắt
     # đầu z ≈ CLS baseline; nhánh MoE chỉ được học tới mức nó thực sự giúp.
-    use_cls_skip:    bool  = True   # đường CLS -> embedding trực tiếp (floor)
+    use_cls_skip:    bool  = False   # đường CLS -> embedding trực tiếp (floor)
     local_gate_init: float = 0.5    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
     bnneck:          bool  = True   # BatchNorm1d trước L2 (False -> LayerNorm như cũ)
 
@@ -54,11 +54,18 @@ class HyMSConfig:
     #   chỉ là mean-pool trá hình (q init 0.02*randn, logits lại chia sqrt(d)).
     # "gem": GeM với p học được. Zero-shot trên DINOv2-L: mean 35.11, GeM p=3
     #   42.08, GeM p=5 50.47, max 68.33 -> p càng lớn càng gần max-pool.
-    pool_type:  str   = "gem"       # "gem" | "attn"
+    pool_type:  str   = "attn"       # "gem" | "attn"
     gem_p_init: float = 3.0
 
     # ── Soft MoE ──────────────────────────────────────────────────────────
     n_experts:        int = 4
+    # ĐO ĐƯỢC: S=8 slot cho m=385 token là bottleneck cực đoan — 8 slot đo được
+    # cos(slot_i,slot_j)=0.773 (gần trùng nhau) và ||slot||/||token||=0.566 (dấu
+    # hiệu lấy trung bình). Soft-MoE paper dùng số slot CÙNG BẬC với số token.
+    # Khuyến nghị thử 8 (=> S=32). Lưu ý khi đổi: route_head là
+    # Linear(num_slots, route_dim) nên rho đổi chiều vào; rr_beta/rr_topk đã tune
+    # cho rho 8-slot có thể phải chỉnh lại (không ảnh hưởng bảng chính vì
+    # eval_routerank mặc định TẮT).
     slots_per_expert: int = 2       # total slots S = n_experts * slots_per_expert
     expert_hidden:    int = 128
     # NƠI ĐẶT MoE — quyết định nó có đóng góp được gì hay không.
@@ -68,9 +75,25 @@ class HyMSConfig:
     #   "cls": CLS được NỐI VÀO tập token, MoE định tuyến bằng chứng đa tỉ lệ
     #     *vào* CLS, phần tinh chỉnh cộng residual vào embedding. gamma_moe=0
     #     => z hệt baseline CLS. Đây là đường duy nhất đặt MoE lên nhánh 90 điểm.
-    moe_target:     str   = "cls"   # "cls" | "tokens"
+    moe_target:     str   = "tokens"   # "cls" | "tokens"
     moe_gate_init:  float = 0.1     # gamma_moe (0 => MoE là identity)
     moe_gate_lr:    float = 1e-2    # LR riêng: scalar gate ở lr=1e-4 gần như bất động
+    # CHUẨN HOÁ DISPATCH (Soft-MoE paper §2.3) — xem models/softmoe.py.
+    # Bản cũ (`logits = LN(X) @ phi`) đo được H(dispatch)/ln m = 0.948 trên
+    # m=385 token, tức dispatch GẦN ĐỀU => mọi slot ~ token trung bình => Soft-MoE
+    # thoái hoá thành mean-pool + MLP, và không tách được khỏi n_experts=1.
+    # True: logits = exp(log_scale) * <norm(X), norm(phi)>, log_scale HỌC ĐƯỢC.
+    # False: khôi phục hành vi cũ — dùng để lấy dòng ablation
+    #        "Soft-MoE (naive)" vs "Soft-MoE (+ paper normalization)".
+    moe_norm_dispatch:    bool  = True
+    # <=0 => sqrt(token_dim) = 27.7, tức phân bố logit TRÙNG bản cũ ở init (nested,
+    # không phá gì) và để model tự học đi ra. Sweep: scale 27.7 -> H/ln m 0.915;
+    # 50 -> 0.738; 100 -> 0.351. Đặt 50.0 nếu muốn vào thẳng vùng chọn lọc.
+    moe_logit_scale_init: float = 0.0
+    # Biên độ nhãn nguồn (ViT / CNN-s2 / CNN-s3) cộng vào token. Init cũ 0.02 chỉ
+    # bằng 2% biên độ token (RMS ~1.0 sau LN) => router gần như không phân biệt
+    # được nguồn => expert KHÔNG chuyên biệt theo nhánh.
+    scale_embed_init:     float = 0.1
 
     # ── Heads ─────────────────────────────────────────────────────────────
     embed_dim:   int = 512          # retrieval embedding z (was 256 bottleneck)
@@ -161,11 +184,11 @@ class HyMSConfig:
         return self.rr_per_dataset.get(dataset.lower(), {})
 
     # ── Training ──────────────────────────────────────────────────────────
-    batch_size:    int   = 128     # class-balanced sampler (see data loader)
+    batch_size:    int   = 120     # class-balanced sampler (see data loader)
     epochs:        int   = 10
     frozen_epochs: int   = 2       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 4       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
-    finetune_cnn_stages: int = 2   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
+    finetune_cnn_stages: int = 1   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
     backbone_lr:   float = 1e-5
     weight_decay:  float = 1e-4
@@ -215,3 +238,4 @@ class HyMSConfig:
 
 
 HCFG = HyMSConfig()
+    
