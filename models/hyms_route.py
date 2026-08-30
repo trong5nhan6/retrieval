@@ -102,8 +102,14 @@ class HyMSRoute(nn.Module):
                 LocalTokenizer(d, num_tokens=cfg.tokens_per_stage))
 
         # ── scale / branch embeddings: 1 for ViT (if on) + 1 per CNN stage ─
+        # ĐO ĐƯỢC: token vào MoE có RMS ~1.0 (LN nội bộ MoE ép về đúng 1.0), nên
+        # init 0.02 khiến nhãn nguồn chỉ bằng 2% biên độ token — router gần như
+        # KHÔNG phân biệt được token đến từ ViT hay CNN-s2 hay CNN-s3, tức expert
+        # không thể chuyên biệt theo nhánh (đúng cái claim trung tâm của bài).
+        # 0.1 = 10% biên độ: thấy được mà chưa lấn át nội dung.
         n_sources = (1 if self.use_vit else 0) + len(self.cnn_stages)
-        self.scale_embed = nn.Parameter(torch.randn(n_sources, d) * 0.02)
+        self.scale_embed = nn.Parameter(
+            torch.randn(n_sources, d) * getattr(cfg, "scale_embed_init", 0.1))
 
         self.input_drop = nn.Dropout(cfg.dropout)
 
@@ -111,7 +117,9 @@ class HyMSRoute(nn.Module):
         self.softmoe = SoftMoE(d, n_experts=cfg.n_experts,
                                slots_per_expert=cfg.slots_per_expert,
                                hidden=cfg.expert_hidden,
-                               gate_init=getattr(cfg, "moe_gate_init", 0.1)
+                               gate_init=getattr(cfg, "moe_gate_init", 0.1),
+                               norm_dispatch=getattr(cfg, "moe_norm_dispatch", True),
+                               logit_scale_init=getattr(cfg, "moe_logit_scale_init", 0.0),
                                ) if self.use_moe else None
         # Hướng A: CLS tham gia tập token (một "nguồn" riêng) và phần MoE tinh
         # chỉnh nó được cộng residual vào embedding. bias=False là BẮT BUỘC —
@@ -220,7 +228,7 @@ class HyMSRoute(nn.Module):
         return z, rho, combine
 
     def gate_parameters(self):
-        """Scalar gate (gamma_moe, GeM p) — cần LR RIÊNG.
+        """Scalar gate (gamma_moe, log_scale, GeM p) — cần LR RIÊNG.
 
         Đo trên local_gate: ở lr=1e-4 nó chỉ đi 0.5003 -> 0.5214 sau 10 epoch,
         tức trần dịch chuyển của Adam (~lr * n_step) quá nhỏ để một scalar gate
@@ -230,6 +238,9 @@ class HyMSRoute(nn.Module):
         ps = []
         if self.softmoe is not None:
             ps.append(self.softmoe.gamma)
+            # log_scale điều khiển độ chọn lọc của dispatch; ở head_lr=1e-4 nó
+            # bất động y như các gate khác, nên phải nằm trong nhóm này.
+            ps.append(self.softmoe.log_scale)
         if isinstance(self.pool, GeMPool):
             ps.append(self.pool.p)
         if getattr(self, "local_gate", None) is not None:
