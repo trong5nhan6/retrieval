@@ -26,7 +26,9 @@ DEFAULT_METRICS = ["R@1", "R@2", "R@4", "R@8", "R-Precision", "mAP@R"]
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--csv", default=None, help="path to test_{run}.csv (overrides dataset/seed)")
+    p.add_argument("--run_dir", default=None,
+                   help="path to a run directory (results/{dataset}/{run}/) — overrides --csv")
+    p.add_argument("--csv", default=None, help="path to test.csv (overrides dataset/seed)")
     p.add_argument("--dataset", default="cub")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--results_dir", default="results")
@@ -143,18 +145,34 @@ def plot_train_loss(csv_path, out=None, title=None):
 
 def main():
     args = parse_args()
-    run = f"hyms_{args.dataset}_seed{args.seed}"
-    csv_path = args.csv or os.path.join(args.results_dir, f"test_{run}.csv")
-    out = args.out or os.path.join(args.results_dir, f"plot_test_{run}.png")
+
+    # resolve run_dir: explicit --run_dir > --csv parent > results/{dataset}/latest
+    if args.run_dir:
+        run_dir = args.run_dir
+    elif args.csv:
+        run_dir = os.path.dirname(os.path.abspath(args.csv))
+    else:
+        # pick the most-recent run folder for this dataset
+        base = os.path.join(args.results_dir, args.dataset)
+        if not os.path.isdir(base):
+            raise SystemExit(f"No run directory found at {base}")
+        runs = sorted(d for d in os.listdir(base) if os.path.isdir(os.path.join(base, d)))
+        if not runs:
+            raise SystemExit(f"No runs found under {base}")
+        run_dir = os.path.join(base, runs[-1])
+        print(f"[plot] using latest run: {run_dir}")
+
+    run = os.path.basename(run_dir)
+    csv_path = args.csv or os.path.join(run_dir, "test.csv")
+    out = args.out or os.path.join(run_dir, "plot_test.png")
     saved = plot_test_metrics(csv_path, out=out, metrics=args.metrics,
                               channels=args.channels, title=f"Test-metric trends — {run}")
     print(f"saved {saved}")
 
-    # also plot the training-loss curve if the matching train CSV exists
-    train_csv = os.path.join(args.results_dir, f"train_{run}.csv")
+    train_csv = os.path.join(run_dir, "train.csv")
     if os.path.exists(train_csv):
         saved_loss = plot_train_loss(train_csv,
-                                     out=os.path.join(args.results_dir, f"plot_train_{run}.png"),
+                                     out=os.path.join(run_dir, "plot_train.png"),
                                      title=f"Training loss — {run}")
         print(f"saved {saved_loss}")
 
