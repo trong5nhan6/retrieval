@@ -255,7 +255,11 @@ def main():
 
     # ── run directory: results/{dataset}/{timestamp}_seed{N}_{active_flags} ──
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    flags = "_".join(k for k, v in [("vit", HCFG.use_vit), ("cnn", HCFG.use_cnn), ("moe", HCFG.use_moe)] if v)
+    flags = "_".join(
+        [k for k, v in [("vit", HCFG.use_vit), ("cnn", HCFG.use_cnn),
+                         ("moe", HCFG.use_moe), ("use_cls_skip", HCFG.use_cls_skip)] if v]
+        + [f"pool_{HCFG.pool_type}", f"embed_dim_{HCFG.embed_dim}"]
+    )
     run = f"{timestamp}_seed{args.seed}_{flags}"
     run_dir = os.path.join(HCFG.results_dir, args.dataset, run)
     os.makedirs(run_dir, exist_ok=True)

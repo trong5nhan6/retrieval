@@ -32,19 +32,19 @@ class HyMSConfig:
     # disables rho/routerank/route-loss automatically (see train/eval).
     use_vit:  bool = True
     use_cnn:  bool = True
-    use_moe:  bool = False
+    use_moe:  bool = True
     # Nhánh "local" = pool(token) -> local_proj. ĐO ĐƯỢC (CUB, ckpt 164207):
     # ép local_gate=0 lúc eval cho R@1 90.19 -> 90.29 và mAP@R 62.41 -> 62.53,
     # tức nhánh này đóng góp ÂM. Nguyên nhân: AttnPool gần uniform => tương
     # đương patch-mean, mà patch-mean của DINOv2-L chỉ đạt 35.11 R@1 so với
     # CLS 89.23. Mặc định TẮT; bật lại bằng --local_branch để lấy bảng ablation.
-    use_local_branch: bool = False
+    use_local_branch: bool = True
 
     # ── Embedding fusion (cải tiến) ───────────────────────────────────────
     # z = L2( norm( cls_proj(CLS) + gate * local_proj(pool(MoE tokens)) ) )
     # CLS skip = "sàn" data-efficient (≈ baseline). gate khởi tạo 0 => lúc bắt
     # đầu z ≈ CLS baseline; nhánh MoE chỉ được học tới mức nó thực sự giúp.
-    use_cls_skip:    bool  = False   # đường CLS -> embedding trực tiếp (floor)
+    use_cls_skip:    bool  = True   # đường CLS -> embedding trực tiếp (floor)
     local_gate_init: float = 0.5    # γ khởi tạo cho nhánh local (LayerScale/ReZero)
     bnneck:          bool  = True   # BatchNorm1d trước L2 (False -> LayerNorm như cũ)
 
@@ -66,7 +66,7 @@ class HyMSConfig:
     # Linear(num_slots, route_dim) nên rho đổi chiều vào; rr_beta/rr_topk đã tune
     # cho rho 8-slot có thể phải chỉnh lại (không ảnh hưởng bảng chính vì
     # eval_routerank mặc định TẮT).
-    slots_per_expert: int = 2       # total slots S = n_experts * slots_per_expert
+    slots_per_expert: int = 4       # total slots S = n_experts * slots_per_expert
     expert_hidden:    int = 128
     # NƠI ĐẶT MoE — quyết định nó có đóng góp được gì hay không.
     #   "tokens": MoE xử lý token rồi pool vào nhánh local (hành vi cũ). Trần của
@@ -147,7 +147,7 @@ class HyMSConfig:
     # (ep1) -> 63% (ep4) -> 92% (ep14) vì sc bão hoà còn rt thì không, và R@1
     # giảm đơn điệu 84.66 -> 83.58 đúng theo nhịp đó. Loss này tác động lên chính
     # phi, tức lên cả đường biểu diễn. Mặc định TẮT trong giai đoạn học biểu diễn.
-    lambda_route:      float = 0.0    # weight routing-consistency loss (0 = TẮT)
+    lambda_route:      float = 0.05    # weight routing-consistency loss (0 = TẮT)
 
     # ── Proxy-Anchor (chạy SONG SONG với loss chính trên z) ───────────────
     # Khi bật, tổng loss = embed_loss(z) + lambda_proxy * ProxyAnchor(z)
@@ -186,7 +186,7 @@ class HyMSConfig:
     # ── Training ──────────────────────────────────────────────────────────
     batch_size:    int   = 120     # class-balanced sampler (see data loader)
     epochs:        int   = 10
-    frozen_epochs: int   = 2       # Stage-1 warmup (backbones frozen)
+    frozen_epochs: int   = 5       # Stage-1 warmup (backbones frozen)
     finetune_blocks: int = 4       # ViT blocks unfrozen in Stage-2 (0 = keep frozen)
     finetune_cnn_stages: int = 1   # ConvNeXt stages unfrozen in Stage-2 (0 = keep frozen, max 4)
     head_lr:       float = 1e-4
